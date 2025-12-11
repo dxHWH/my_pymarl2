@@ -3,6 +3,8 @@ from components.episode_buffer import EpisodeBatch
 from modules.mixers.nmix import Mixer
 from modules.mixers.vdn import VDNMixer
 from modules.mixers.qatten import QattenMixer
+from modules.mixers.nqmix import NQMixer
+from modules.mixers.attention_qmix import AttentionQMixer
 from envs.matrix_game import print_matrix_status
 from utils.rl_utils import build_td_lambda_targets, build_q_lambda_targets
 import torch as th
@@ -26,6 +28,10 @@ class NQLearner:
             self.mixer = VDNMixer()
         elif args.mixer == "qmix":
             self.mixer = Mixer(args)
+        elif args.mixer == "nqmix":
+            self.mixer = NQMixer(args)
+        elif args.mixer == "attention_qmix":
+            self.mixer = AttentionQMixer(args)
         else:
             raise "mixer error"
         self.target_mixer = copy.deepcopy(self.mixer)
@@ -53,8 +59,8 @@ class NQLearner:
         
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, per_weight=None):
         # Get the relevant quantities
-        rewards = batch["reward"][:, :-1]
-        actions = batch["actions"][:, :-1]
+        rewards = batch["reward"][:, :-1] # bs,t,1
+        actions = batch["actions"][:, :-1] 
         terminated = batch["terminated"][:, :-1].float()
         mask = batch["filled"][:, :-1].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
@@ -105,7 +111,19 @@ class NQLearner:
                                                     self.args.n_agents, self.args.gamma, self.args.td_lambda)
 
         # Mixer
-        chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
+        if self.args.mixer == "attention_qmix":
+            # 对于attention_qmix，需要传递actions、observations和qvals
+            # 使用保存的完整Q值而不是只使用选中动作的Q值
+            all_qvals = batch["qvals"][:, :-1]  # [batch_size, seq_len, n_agents, n_actions]
+            chosen_action_qvals = self.mixer(
+                chosen_action_qvals, 
+                batch["state"][:, :-1],
+                actions,
+                batch["obs"][:, :-1],
+                all_qvals
+            )
+        else:
+            chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
 
         td_error = (chosen_action_qvals - targets.detach())
         td_error2 = 0.5 * td_error.pow(2)

@@ -100,7 +100,17 @@ class EpisodeBatch:
                 raise KeyError("{} not found in transition or episode data".format(k))
 
             dtype = self.scheme[k].get("dtype", th.float32)
-            v = th.tensor(v, dtype=dtype, device=self.device)
+            # === [修复] 显式转换为 numpy，解决 Warning 并加速 ===
+            if isinstance(v, list):
+                v = np.array(v)
+            # ================================================
+
+            if isinstance(v, th.Tensor):
+                v = v.clone().detach().to(dtype=dtype, device=self.device)
+            else:
+                v = th.tensor(v, dtype=dtype, device=self.device)
+
+            # v = th.tensor(v, dtype=dtype, device=self.device)
             self._check_safe_view(v, target[k][_slices])
             target[k][_slices] = v.view_as(target[k][_slices])
 
@@ -195,6 +205,9 @@ class EpisodeBatch:
         return parsed
 
     def max_t_filled(self):
+        # self.data.transition_data["filled"] bs,ep_limit,1
+        # 在ep_limit维度上求和，得到每条轨迹的实际长度，(ep_len1,eplen_2,...)  ——> bs，1
+        # [bs,1].max(0) -->找到最大的那个 ep_len，返回（ep_len_max， ep_len_max在原来[bs,1]中的索引） 
         return th.sum(self.data.transition_data["filled"], 1).max(0)[0]
 
     def __repr__(self):

@@ -13,11 +13,11 @@ log_interval: 2000 # Log summary of stats after every {} timesteps
 runner_log_interval: 2000 # Log runner stats (not test stats) every {} timesteps
 learner_log_interval: 2000 # Log training stats every {} timesteps
 t_max: 10000 # Stop running after this many timesteps
-use_cuda: True # Use gpu by default unless it isn't available
+use_cuda: True # Use gpu by default unless it yisn't available
 buffer_cpu_only: True # If true we won't keep all of the replay buffer in vram
 
 # --- Logging options ---
-use_tensorboard: False # Log results to tensorboard
+use_tensorboard: True # Log results to tensorboard
 save_model: False # Save the models to disk
 save_model_interval: 2000000 # Save models after this many timesteps
 checkpoint_path: "" # Load a checkpoint from this path
@@ -45,5 +45,38 @@ obs_last_action: True # Include the agent's last action (one_hot) in the observa
 # --- Experiment running params ---
 repeat_id: 1
 label: "default_label"
-
+# seed: 398410299
 run: "default"
+
+
+# set seed
+seed: 79 # Set the random seed for the experiment
+
+# --- VAE 总开关 (用于 Runner 和 MAC) ---
+use_critical_agent_obs: True
+# (注意: Runner 启动时会 *尝试* 加载此路径, 但如果在线训练开启, 它会被 Learner 的模型覆盖)
+vae_encoder_path: "src/world_model_for_key_agent/vae_models/5m_vs_6m/vae_encoder_5m6m_all_data_best.pt" 
+vae_hidden_dim: 512
+vae_latent_dim: 64
+stop_action_id: 5 # stop action 的动作 ID
+vae_activation: 0
+
+# --- VAE 在线端到端训练 (用于 Learner) --- 
+use_online_vae_training: True # (键名修正: use_online_vae -> use_online_vae_training)
+vae_lr: 0.0005                  # VAE 优化器的学习率
+
+
+# --- KL 退火 (Annealing) 配置 ---
+vae_kl_anneal_start_t: 50000     # (t_env < 100k 步时, beta=0)
+vae_beta_max: 0.1                 # (beta 的最终目标值)
+
+# (键名修正: vae_kl_anneal_end_t -> vae_kl_anneal_duration_t)
+# (您设置的 end_t=500000, start_t=100000, 所以 duration = 400000)
+vae_kl_anneal_duration_t: 150000  # (在 100k 到 500k 步之间, beta 从 0 增长到 0.1
+
+
+
+
+#消融实验：
+use_ablation: False  # 是否使用消融实验
+

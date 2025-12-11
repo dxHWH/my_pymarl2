@@ -4,6 +4,12 @@ from torch.distributions import Categorical
 from torch.distributions.one_hot_categorical import OneHotCategorical
 from .epsilon_schedules import DecayThenFlatSchedule
 
+# 动作选择器：
+# 1. GumbelSoftmaxMultinomialActionSelector：基于Gumbel-Softmax的多项式分布动作选择器
+# 2. MultinomialActionSelector：基于多项式分布的动作选择器
+# 3. EpsilonGreedyActionSelector：基于ε-贪婪算法的动作选择器
+# 4. GaussianActionSelector：基于高斯分布的动作选择器
+
 class GumbelSoftmax(OneHotCategorical):
 
     def __init__(self, logits, probs=None, temperature=1):
@@ -68,7 +74,6 @@ class GumbelSoftmaxMultinomialActionSelector():
 
 REGISTRY["gumbel"] = GumbelSoftmaxMultinomialActionSelector
 
-
 class MultinomialActionSelector():
 
     def __init__(self, args):
@@ -123,16 +128,19 @@ class EpsilonGreedyActionSelector():
     def select_action(self, agent_inputs, avail_actions, t_env, test_mode=False):
 
         # Assuming agent_inputs is a batch of Q-Values for each agent bav
+        # 计算当前时间步的Epsilon
         self.epsilon = self.schedule.eval(t_env)
 
+        # 测试模式下，根据参数上确定值选择  
         if test_mode:
             # Greedy action selection only
             self.epsilon  = getattr(self.args, "test_noise", 0.0)
 
         # mask actions that are excluded from selection
-        masked_q_values = agent_inputs.clone()
+        masked_q_values = agent_inputs.clone() # bs_run， n_agents, n_actions
         masked_q_values[avail_actions == 0] = -float("inf")  # should never be selected!
         
+        #取随机数，确定如何采样
         random_numbers = th.rand_like(agent_inputs[:, :, 0])
         pick_random = (random_numbers < self.epsilon).long()
         random_actions = Categorical(avail_actions.float()).sample().long()

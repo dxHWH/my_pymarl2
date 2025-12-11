@@ -10,6 +10,7 @@ import sys
 import torch as th
 from utils.logging import get_logger
 import yaml
+import time
 
 from run import REGISTRY as run_REGISTRY
 
@@ -48,7 +49,7 @@ def _get_config(params, arg_name, subfolder):
     if config_name is not None:
         with open(os.path.join(os.path.dirname(__file__), "config", subfolder, "{}.yaml".format(config_name)), "r") as f:
             try:
-                config_dict = yaml.load(f)
+                config_dict = yaml.safe_load(f)
             except yaml.YAMLError as exc:
                 assert False, "{}.yaml error: {}".format(config_name, exc)
         return config_dict
@@ -83,11 +84,11 @@ def parse_command(params, key, default):
 
 if __name__ == '__main__':
     params = deepcopy(sys.argv)
-
+    #配置文件的读取方式，按照default->env->alg的顺序来，即env、alg中yaml的内容在工作流中覆盖掉default中的内容
     # Get the defaults from default.yaml
     with open(os.path.join(os.path.dirname(__file__), "config", "default.yaml"), "r") as f:
         try:
-            config_dict = yaml.load(f)
+            config_dict = yaml.safe_load(f)
         except yaml.YAMLError as exc:
             assert False, "default.yaml error: {}".format(exc)
 
@@ -98,17 +99,33 @@ if __name__ == '__main__':
     config_dict = recursive_dict_update(config_dict, env_config)
     config_dict = recursive_dict_update(config_dict, alg_config)
 
+
+    # 是否在Qi上套一个双曲正弦sinh
+    use_sinh = config_dict.get("use_sinh", False)
+    if use_sinh:
+        config_dict['name'] = config_dict['name'] + "_sinh"
+    # set seed and rename config_dict['name']
+    seed = config_dict.get('seed',None)
+    if seed is not None:
+        config_dict['name'] = "{}_seed_{}".format(config_dict['name'], seed)
+    else:
+        seed = int(time.time())
+        config_dict['seed'] = seed
+
     # now add all the config to sacred
+    #记录程序运行的配置信息，未注释时，运行时生成result和其中的json文件
     ex.add_config(config_dict)
 
     # Save to disk by default for sacred
     map_name = parse_command(params, "env_args.map_name", config_dict['env_args']['map_name'])
     algo_name = parse_command(params, "name", config_dict['name']) 
+
     file_obs_path = join(results_path, "sacred", map_name, algo_name)
     
     logger.info("Saving to FileStorageObserver in {}.".format(file_obs_path))
     ex.observers.append(FileStorageObserver.create(file_obs_path))
 
+    # 调用到run/run.py的run中
     ex.run_commandline(params)
 
     # flush

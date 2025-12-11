@@ -9,8 +9,9 @@ from .central_rnn_agent import CentralRNNAgent
 from .mlp_agent import MLPAgent
 from .atten_rnn_agent import ATTRNNAgent
 from .noisy_agents import NoisyRNNAgent
+from .cf_att import ATTRNNAgent as  CFAgent
 
-REGISTRY["rnn"] = RNNAgent
+REGISTRY["rnn"] = RNNAgent  
 REGISTRY["n_rnn"] = NRNNAgent
 REGISTRY["rnn_ppo"] = RNNPPOAgent
 REGISTRY["conv_agent"] = ConvAgent
@@ -19,3 +20,4 @@ REGISTRY["central_rnn"] = CentralRNNAgent
 REGISTRY["mlp"] = MLPAgent
 REGISTRY["att_rnn"] = ATTRNNAgent
 REGISTRY["noisy_rnn"] = NoisyRNNAgent
+REGISTRY["cf_agent"] = CFAgent

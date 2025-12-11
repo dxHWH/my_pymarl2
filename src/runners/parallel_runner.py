@@ -1,3 +1,18 @@
+"""
+并行环境运行器（ParallelRunner）
+
+该模块提供了一个轻量的基于子进程的并行环境封装，灵感来自
+OpenAI Baselines 中的 SubprocVecEnv。主要用途是在多个子进程中并行
+运行环境实例，从而在多智能体训练时以批量方式收集经验。
+
+主要组成：
+- ParallelRunner: 在主进程中管理多个子进程和收集 batch 数据。
+- env_worker: 子进程函数，接收主进程命令（reset、step、get_stats 等）并执行。
+- CloudpickleWrapper: 用于对可调用对象进行序列化，避免 multiprocessing 使用 pickle 时出错。
+
+注意：本文件只对代码添加中文注释，不更改原有逻辑。
+"""
+
 from envs import REGISTRY as env_REGISTRY
 from functools import partial
 from components.episode_buffer import EpisodeBatch
@@ -16,18 +31,24 @@ class ParallelRunner:
         self.batch_size = self.args.batch_size_run
 
         # Make subprocesses for the envs
+        # 创建 pipe 对：parent_conns 在主进程用于和每个子进程通信，worker_conns 给子进程使用
         self.parent_conns, self.worker_conns = zip(*[Pipe() for _ in range(self.batch_size)])
+
+        # 从环境注册表中获取环境工厂函数（不实例化），用于序列化后在子进程中创建环境
         env_fn = env_REGISTRY[self.args.env]
         self.ps = []
         for i, worker_conn in enumerate(self.worker_conns):
-            ps = Process(target=env_worker, 
-                    args=(worker_conn, CloudpickleWrapper(partial(env_fn, **self.args.env_args))))
+            # CloudpickleWrapper 用于跨进程传递可调用对象（partial(env_fn, **env_args)）
+            ps = Process(target=env_worker,
+                         args=(worker_conn, CloudpickleWrapper(partial(env_fn, **self.args.env_args))))
             self.ps.append(ps)
 
+        # 将子进程设为守护进程并启动
         for p in self.ps:
             p.daemon = True
             p.start()
 
+        # 向第一个子进程请求环境信息（假设每个环境的信息是一致的）
         self.parent_conns[0].send(("get_env_info", None))
         self.env_info = self.parent_conns[0].recv()
         self.episode_limit = self.env_info["episode_limit"]
@@ -106,6 +127,8 @@ class ParallelRunner:
             else:
                 actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, bs=envs_not_terminated, test_mode=test_mode)
                 
+            # 将 actions 从 GPU（或当前 device）移动到 CPU 并转成 numpy 数组以传入子进程
+            # 注意：actions 需要确保不是 requires_grad=True，否则 .numpy() 会报错（应先 detach()）
             cpu_actions = actions.to("cpu").numpy()
 
             # Update the actions taken
@@ -223,29 +246,32 @@ class ParallelRunner:
 
 
 def env_worker(remote, env_fn):
-    # Make environment
+    # 在子进程中创建环境并循环等待主进程命令
+    # env_fn 是 CloudpickleWrapper(partial(env_factory, **env_args))，因此取出 .x() 来实例化环境
     env = env_fn.x()
     while True:
         cmd, data = remote.recv()
         if cmd == "step":
+            # data 中包含每个 agent 的动作，执行一步并返回本步的 reward/terminated/info
             actions = data
-            # Take a step in the environment
+            # 注意：env.step 的返回格式需与这里的解包方式兼容（reward, terminated, env_info）
             reward, terminated, env_info = env.step(actions)
-            # Return the observations, avail_actions and state to make the next action
+            # 获取下一时刻用于决策的观测数据
             state = env.get_state()
             avail_actions = env.get_avail_actions()
             obs = env.get_obs()
             remote.send({
-                # Data for the next timestep needed to pick an action
+                # 下一时刻需要的观测数据
                 "state": state,
                 "avail_actions": avail_actions,
                 "obs": obs,
-                # Rest of the data for the current timestep
+                # 本时刻步的信息
                 "reward": reward,
                 "terminated": terminated,
                 "info": env_info
             })
         elif cmd == "reset":
+            # 重置环境并返回初始观测
             env.reset()
             remote.send({
                 "state": env.get_state(),
@@ -253,14 +279,18 @@ def env_worker(remote, env_fn):
                 "obs": env.get_obs()
             })
         elif cmd == "close":
+            # 关闭环境并结束循环
             env.close()
             remote.close()
             break
         elif cmd == "get_env_info":
+            # 返回环境静态信息（例如 episode_limit、n_agents 等）
             remote.send(env.get_env_info())
         elif cmd == "get_stats":
+            # 返回统计信息（如胜负、伤害等额外信息）
             remote.send(env.get_stats())
         else:
+            # 未实现的命令
             raise NotImplementedError
 
 

@@ -60,7 +60,7 @@ class EpisodeRunner:
                 "obs": [self.env.get_obs()]
             }
 
-            self.batch.update(pre_transition_data, ts=self.t)
+            self.batch.update(pre_transition_data, None ,ts=self.t)
 
             # Pass the entire batch of experiences up till now to the agents
             # Receive the actions for each agent at this timestep in a batch of size 1
@@ -68,7 +68,7 @@ class EpisodeRunner:
             # Fix memory leak
             cpu_actions = actions.to("cpu").numpy()
             
-            reward, terminated, env_info = self.env.step(actions[0])
+            reward, terminated, env_info = self.env.step(cpu_actions[0])
             episode_return += reward
 
             post_transition_data = {

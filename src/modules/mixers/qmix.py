@@ -44,11 +44,17 @@ class QMixer(nn.Module):
         bs = agent_qs.size(0)
         states = states.reshape(-1, self.state_dim)
         agent_qs = agent_qs.reshape(-1, 1, self.n_agents)
+        # use sinh
+        if self.args.use_sinh:
+            sinh_agent_qs = th.sinh(agent_qs).detach()
+            agent_qs = agent_qs + (sinh_agent_qs - agent_qs)
+
         # First layer
         w1 = self.hyper_w_1(states).abs() if self.abs else self.hyper_w_1(states)
         b1 = self.hyper_b_1(states)
         w1 = w1.view(-1, self.n_agents, self.embed_dim)
         b1 = b1.view(-1, 1, self.embed_dim)
+        # th.bmm（Batch Matrix Multiplication）执行批量矩阵乘法
         hidden = F.elu(th.bmm(agent_qs, w1) + b1)
         
         # Second layer
@@ -63,16 +69,23 @@ class QMixer(nn.Module):
         
         return q_tot
 
+
+    # 用于向外分析智能体贡献
     def k(self, states):
         bs = states.size(0)
-        w1 = th.abs(self.hyper_w_1(states))
-        w_final = th.abs(self.hyper_w_final(states))
-        w1 = w1.view(-1, self.n_agents, self.embed_dim)
-        w_final = w_final.view(-1, self.embed_dim, 1)
+        w1 = th.abs(self.hyper_w_1(states))  # 形状: [batch_size, n_agents*embed_dim]
+        w_final = th.abs(self.hyper_w_final(states)) # 形状: [batch_size, embed_dim]
+
+        w1 = w1.view(-1, self.n_agents, self.embed_dim) # [batch_size, n_agents, embed_dim]
+        w_final = w_final.view(-1, self.embed_dim, 1)# [batch_size, embed_dim, 1]
+     
+
+        # 
         k = th.bmm(w1,w_final).view(bs, -1, self.n_agents)
         k = k / th.sum(k, dim=2, keepdim=True)
         return k
-
+    
+    # 分析环境基础值
     def b(self, states):
         bs = states.size(0)
         w_final = th.abs(self.hyper_w_final(states))

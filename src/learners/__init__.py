@@ -9,7 +9,12 @@ from .max_q_learner import MAXQLearner
 from .dmaq_qatten_learner import DMAQ_qattenLearner
 from .offpg_learner import OffPGLearner
 from .fmac_learner import FMACLearner
+from .cf_learner import DMAQ_qattenLearner as CF_Learner
+from .nq_vae_learner import NQLearnerVAE
+from .dvd_learner import DVDNQLearner
 
+
+#将不同的learner类注册到REGISTRY字典中
 REGISTRY = {}
 
 REGISTRY["q_learner"] = QLearner
@@ -23,3 +28,7 @@ REGISTRY["max_q_learner"] = MAXQLearner
 REGISTRY["dmaq_qatten_learner"] = DMAQ_qattenLearner
 REGISTRY["offpg_learner"] = OffPGLearner
 REGISTRY["fmac_learner"] = FMACLearner
+# REGISTRY["cf_learner"] = CF_Learner
+# REGISTRY["q_with_action_attention_learner"]
+REGISTRY["nq_vae_learner"] = NQLearnerVAE
+REGISTRY["dvd_learner"] = DVDNQLearner

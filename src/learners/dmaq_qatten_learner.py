@@ -2,6 +2,8 @@
 import copy
 from components.episode_buffer import EpisodeBatch
 from modules.mixers.dmaq_general import DMAQer
+from modules.mixers.dmaq_general_realMax import DMAMAXQer
+import torch.nn as nn
 import torch.nn.functional as F
 import torch as th
 from torch.optim import Adam
@@ -23,6 +25,8 @@ class DMAQ_qattenLearner:
         if args.mixer is not None:
             if args.mixer == "dmaq":
                 self.mixer = DMAQer(args)
+            elif args.mixer == "dmaq_real":
+                self.mixer = DMAMAXQer(args)
             else:
                 raise ValueError("Mixer {} not recognised.".format(args.mixer))
             self.params += list(self.mixer.parameters())
@@ -104,14 +108,16 @@ class DMAQ_qattenLearner:
 
         # Mix
         if mixer is not None:
-            ans_chosen = mixer(chosen_action_qvals, batch["state"][:, :-1], is_v=True)
-            ans_adv = mixer(chosen_action_qvals, batch["state"][:, :-1], actions=actions_onehot,
+
+            ##！！
+            # ans_chosen = mixer(chosen_action_qvals, batch["state"][:, :-1], is_v=True)
+            ans_adv , ans_max = mixer(chosen_action_qvals, batch["state"][:, :-1], actions=actions_onehot,
                             max_q_i=max_action_qvals, is_v=False)
-            chosen_action_qvals = ans_chosen + ans_adv
+            chosen_action_qvals = ans_max + ans_adv
 
             if self.args.double_q:
-                target_chosen = self.target_mixer(target_chosen_qvals, batch["state"], is_v=True)
-                target_adv = self.target_mixer(target_chosen_qvals, batch["state"],
+                # target_chosen = self.target_mixer(target_chosen_qvals, batch["state"], is_v=True)
+                target_adv ,target_chosen= self.target_mixer(target_chosen_qvals, batch["state"],
                                                 actions=cur_max_actions_onehot,
                                                 max_q_i=target_max_qvals, is_v=False)
                 target_max_qvals = target_chosen + target_adv

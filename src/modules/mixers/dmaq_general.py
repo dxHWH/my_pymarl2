@@ -65,13 +65,16 @@ class DMAQer(nn.Module):
         agent_qs = agent_qs.view(-1, self.n_agents)
 
         w_final = self.hyper_w_final(states)
-        w_final = th.abs(w_final)
+        w_final = th.abs(w_final) # w
         w_final = w_final.view(-1, self.n_agents) + 1e-10
-        v = self.V(states)
+        v = self.V(states) # b
         v = v.view(-1, self.n_agents)
 
+        # 算选择的q   
         if self.args.weighted_head:
-            agent_qs = w_final * agent_qs + v
+            agent_qs = w_final * agent_qs + v # transfomation
+
+        # 算最大q
         if not is_v:
             max_q_i = max_q_i.view(-1, self.n_agents)
             if self.args.weighted_head:

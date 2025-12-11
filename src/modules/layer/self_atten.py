@@ -14,13 +14,14 @@ class SelfAttention(nn.Module):
         self.tovalues = nn.Linear(self.input_size, self.emb_size * heads, bias = False)
 
     def forward(self, x):
-        b, t, hin = x.size()
+        b, t, hin = x.size() # bs, n ,e
+
         assert hin == self.input_size, f'Input size {{hin}} should match {{self.input_size}}'
         
-        h = self.heads 
-        e = self.emb_size
+        h = self.heads # multi heads
+        e = self.emb_size # attention embed size
         
-        keys = self.tokeys(x).view(b, t, h, e)
+        keys = self.tokeys(x).view(b, t, h, e) # 
         queries = self.toqueries(x).view(b, t, h, e)
         values = self.tovalues(x).view(b, t, h, e)
 
