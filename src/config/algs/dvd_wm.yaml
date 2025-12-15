@@ -1,0 +1,41 @@
+# --- DVD with World Model Config ---
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "episode"
+buffer_size: 5000
+target_update_interval: 200
+
+# Learner & Mixer
+learner: "dvd_wm_learner"
+mixer: "dvd_wm"
+
+# Standard QMIX params
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+hypernet_hidden_dim: 64
+
+# --- World Model Specific Params (New & Isolated) ---
+world_model_type: "vae_rnn"
+wm_hidden_dim: 64        # 世界模型 RNN 隐层维度 (替代 rnn_hidden_dim)
+wm_latent_dim: 32        # VAE 潜变量维度 Z
+dvd_samples: 8           # 去混淆采样次数
+wm_kl_beta: 0.1          # KL Loss 权重
+wm_loss_weight: 1.0      # 总 Loss 权重
+
+# --- Optimization Params ---
+lr: 0.001                # Agent (RL) 学习率 (Adam)
+wm_lr: 0.0005            # World Model 学习率 (独立设置，通常比 RL 小)
+optimizer: 'adam'
+
+name: "dvd_wm_qmix"
+
+# Agent params
+mac: "n_mac"
+agent: "n_rnn"
+agent_output_type: q
+td_lambda: 0.6
