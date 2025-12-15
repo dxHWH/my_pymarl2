@@ -53,7 +53,11 @@ run: "default"
 seed: 79 # Set the random seed for the experiment
 
 # --- VAE 总开关 (用于 Runner 和 MAC) ---
+<<<<<<< HEAD
 use_critical_agent_obs: False
+=======
+use_critical_agent_obs: True
+>>>>>>> origin/main
 # (注意: Runner 启动时会 *尝试* 加载此路径, 但如果在线训练开启, 它会被 Learner 的模型覆盖)
 vae_encoder_path: "src/world_model_for_key_agent/vae_models/5m_vs_6m/vae_encoder_5m6m_all_data_best.pt" 
 vae_hidden_dim: 512
@@ -62,7 +66,11 @@ stop_action_id: 5 # stop action 的动作 ID
 vae_activation: 0
 
 # --- VAE 在线端到端训练 (用于 Learner) --- 
+<<<<<<< HEAD
 use_online_vae_training: False # (键名修正: use_online_vae -> use_online_vae_training)
+=======
+use_online_vae_training: True # (键名修正: use_online_vae -> use_online_vae_training)
+>>>>>>> origin/main
 vae_lr: 0.0005                  # VAE 优化器的学习率
 
 

@@ -1,3 +1,4 @@
+
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
@@ -198,10 +199,12 @@ class DVDMixer(nn.Module):
         
         return q_tot
 
+
 # import torch as th
 # import torch.nn as nn
 # import torch.nn.functional as F
 # import numpy as np
+
 
 # class MultiHeadGAT(nn.Module):
 #     """
@@ -209,12 +212,18 @@ class DVDMixer(nn.Module):
 #     对应论文公式 (8), (9), (10) [cite: 188-196]
 #     作用: 构建轨迹图 (Trajectory Graph) 并提取智能体间的关系特征
 #     """
+
+# # --- 1. 定义多头图注意力层 (Multi-Head GAT) ---
+# # 对应论文公式 (8), (9), (10)
+# # 这里的图是全连接的 (Fully Connected)，所以我们不需要邻接矩阵，直接做 Attention
+# class MultiHeadGAT(nn.Module):
+
 #     def __init__(self, input_dim, hidden_dim, n_heads):
 #         super(MultiHeadGAT, self).__init__()
 #         self.input_dim = input_dim
 #         self.hidden_dim = hidden_dim
 #         self.n_heads = n_heads
-        
+
 #         # W 矩阵: 线性变换 h -> h' [cite: 189]
 #         self.W = nn.Linear(input_dim, n_heads * hidden_dim, bias=False)
         
@@ -222,10 +231,12 @@ class DVDMixer(nn.Module):
 #         # 输入是拼接的 [Wh_i || Wh_j], 维度为 2 * hidden_dim
 #         self.att_a = nn.Parameter(th.Tensor(1, n_heads, 2 * hidden_dim))
 #         nn.init.xavier_uniform_(self.att_a.data, gain=1.414)
+
         
 #         self.leaky_relu = nn.LeakyReLU(0.2)
 
 #     def forward(self, h):
+
 #         # h: (batch_size, n_agents, input_dim)
 #         bs, n_agents, _ = h.size()
         
@@ -263,12 +274,14 @@ class DVDMixer(nn.Module):
 #     Deconfounded Value Decomposition (DVD) Mixer
 #     基于 QMIX 架构，但在 Credit Assignment (Layer 2) 引入因果推断的轨迹图
 #     """
+
 #     def __init__(self, args):
 #         super(DVDMixer, self).__init__()
 #         self.args = args
 #         self.n_agents = args.n_agents
 #         self.state_dim = int(np.prod(args.state_shape))
 #         self.embed_dim = args.mixing_embed_dim
+
 #         self.abs = getattr(self.args, 'abs', True) # 单调性约束 [cite: 200]
         
 #         # DVD 参数
@@ -300,6 +313,7 @@ class DVDMixer(nn.Module):
 #                                            self.n_heads * self.embed_dim * (self.n_agents * self.gat_dim))
 
 #         # V(s): 全局状态价值偏置 (公式 14 中的 Bias 部分)
+
 #         self.V = nn.Sequential(nn.Linear(self.state_dim, self.embed_dim),
 #                                nn.ReLU(inplace=True),
 #                                nn.Linear(self.embed_dim, 1))
@@ -309,6 +323,7 @@ class DVDMixer(nn.Module):
 #         Args:
 #             agent_qs: (batch, T, n_agents)
 #             states: (batch, T, state_dim)
+<<<<<<< HEAD
 #             hidden_states: (batch, T, n_agents, rnn_hidden_dim) - 用于构建图
 #         """
 #         bs = agent_qs.size(0)
@@ -374,9 +389,11 @@ class DVDMixer(nn.Module):
 #         # 计算 Q_tot (公式 13)
 #         # Q_tot = Sum(K * Q_inter) + V
 #         # bmm: (bs*T, 1, embed) @ (bs*T, embed, 1) -> (bs*T, 1, 1)
+
 #         y = th.bmm(hidden, w_final) + v
         
 #         # 重塑回 (batch, T, 1)
 #         q_tot = y.view(bs, -1, 1)
         
+<<<<<<< HEAD
 #         return q_tot
