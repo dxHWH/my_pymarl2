@@ -1,4 +1,3 @@
-
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
@@ -323,7 +322,7 @@ class DVDMixer(nn.Module):
 #         Args:
 #             agent_qs: (batch, T, n_agents)
 #             states: (batch, T, state_dim)
-<<<<<<< HEAD
+
 #             hidden_states: (batch, T, n_agents, rnn_hidden_dim) - 用于构建图
 #         """
 #         bs = agent_qs.size(0)
@@ -395,5 +394,4 @@ class DVDMixer(nn.Module):
 #         # 重塑回 (batch, T, 1)
 #         q_tot = y.view(bs, -1, 1)
         
-<<<<<<< HEAD
 #         return q_tot

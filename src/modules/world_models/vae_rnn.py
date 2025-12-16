@@ -90,3 +90,34 @@ class VAERNNWorldModel(nn.Module):
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
         
         return recon_loss, kl_loss
+    # 文件: src/modules/world_models/vae_rnn.py
+
+
+
+    # [新增这个方法到 VAERNNWorldModel 类中]
+    def decode(self, z, hidden_state):
+        """
+        手动解码预测 Next State
+        z: [B, Latent]
+        hidden_state: [B, Hidden]
+        """
+        inp = torch.cat([z, hidden_state], dim=-1) # [B, Latent + Hidden]
+        pred_next_state = self.decoder(inp)        # [B, State_Dim]
+        return pred_next_state
+    
+    def predict(self, obs_input, hidden_state, use_mean=True):
+        """
+        单步预测: State_t + Action_t -> State_{t+1}
+        """
+        # 1. 只有 Inference (Encoder + RNN)
+        next_hidden, (mu, logvar) = self.forward_step(obs_input, hidden_state)
+        
+        # 2. Latent Sampling (测试时通常使用均值 mu 以获得确定性结果)
+        z = mu if use_mean else self.sample_latents((mu, logvar), num_samples=1).squeeze(0)
+        
+        # 3. Decode
+        inp = torch.cat([z, next_hidden], dim=-1)
+        pred_next_state = self.decoder(inp) # [B, State_Dim]
+        
+        return pred_next_state, next_hidden
+

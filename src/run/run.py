@@ -244,8 +244,18 @@ def run_sequential(args, logger):
             last_time = time.time()
 
             last_test_T = runner.t_env
-            for _ in range(n_test_runs):
-                runner.run(test_mode=True)
+            # 用于收集测试 batch
+            test_batch = None
+            
+            for i in range(n_test_runs):
+                batch = runner.run(test_mode=True)
+                # 我们只取第一个 batch 来计算指标，避免计算量过大影响速度
+                if i == 0:
+                    test_batch = batch
+
+            # 调用 Learner 计算 WM 指标
+            if test_batch is not None and hasattr(learner, "evaluate_world_model"):
+                learner.evaluate_world_model(test_batch, runner.t_env)
 
         if args.save_model and (runner.t_env - model_save_time >= args.save_model_interval or model_save_time == 0):
             #如果save_model激活 并且 运行时间步 超出了save_model_interval，则保存模型

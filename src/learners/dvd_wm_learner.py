@@ -138,7 +138,11 @@ class DVDWMLearner:
         chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1], z_eval)
         
         with th.no_grad():
-            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:], z_target)
+            # target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:], z_target)
+
+            # [修复后代码] 
+            # 对 target_max_qvals 进行切片 [:, 1:]，对应 t=1 到 t=T，与 state[:, 1:] 对齐
+            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"], z_tensor)
             
             if getattr(self.args, 'q_lambda', False):
                  pass 
@@ -177,6 +181,83 @@ class DVDWMLearner:
         self.target_mac.load_state(self.mac)
         if self.mixer is not None:
             self.target_mixer.load_state_dict(self.mixer.state_dict())
+
+    def evaluate_world_model(self, batch, t_env):
+        # 1. 数据准备
+        if batch.device != self.args.device:
+            batch.to(self.args.device)
+            
+        bs = batch.batch_size
+        max_t = batch.max_seq_length
+        
+        # 构建输入: Global State + Joint Actions
+        joint_actions = batch["actions_onehot"].reshape(bs, max_t, -1)
+        wm_inputs = th.cat([batch["state"], joint_actions], dim=-1)
+        
+        # 真实标签 (从 t=1 到 t=T 的状态)
+        target_states = batch["state"][:, 1:] 
+        mask = batch["filled"][:, :-1].float().squeeze(-1) # [B, T-1] 用于过滤填充数据
+
+        # 2. 切换评估模式
+        self.world_model.eval()
+        
+        pred_states_list = []
+        
+        with th.no_grad():
+            wm_hidden = self.world_model.init_hidden(bs, self.device)
+            
+            # 循环预测 t=0 到 t=T-1
+            for t in range(max_t - 1):
+                # 使用 predict 接口
+                pred_next_state, wm_hidden = self.world_model.predict(
+                    wm_inputs[:, t], wm_hidden, use_mean=True
+                )
+                pred_states_list.append(pred_next_state)
+            
+            # 堆叠预测结果 [B, T-1, State_Dim]
+            pred_states = th.stack(pred_states_list, dim=1)
+
+            # 3. 计算指标
+            # (1) MSE (Mean Squared Error)
+            errors = (pred_states - target_states) ** 2
+            # 对 State 维度求和/平均 -> [B, T-1]
+            mse_per_step = errors.mean(dim=-1) 
+            # 应用 Mask (只计算有效时间步)
+            masked_mse = (mse_per_step * mask).sum() / mask.sum()
+            
+            # (2) R^2 Score (Coefficient of Determination)
+            # R2 = 1 - (SS_res / SS_tot)
+            # SS_res = sum((y_true - y_pred)^2)
+            # SS_tot = sum((y_true - y_mean)^2)
+            
+            # 将 Tensor 展平以便计算全局 R2
+            mask_bool = mask.bool() # [B, T-1]
+            # 只取有效数据
+            y_true_flat = target_states[mask_bool.unsqueeze(-1).expand_as(target_states)].reshape(-1, self.state_dim)
+            y_pred_flat = pred_states[mask_bool.unsqueeze(-1).expand_as(pred_states)].reshape(-1, self.state_dim)
+            
+            ss_res = ((y_true_flat - y_pred_flat) ** 2).sum()
+            y_mean = y_true_flat.mean(dim=0) # 对每个状态特征维度求均值
+            ss_tot = ((y_true_flat - y_mean) ** 2).sum()
+            
+            # 避免除以零
+            if ss_tot.item() == 0:
+                r2_score = 0.0
+            else:
+                r2_score = 1 - (ss_res / ss_tot)
+
+            # 4. 打印与日志记录
+            log_prefix = "test_wm_"
+            self.logger.log_stat(log_prefix + "mse", masked_mse.item(), t_env)
+            self.logger.log_stat(log_prefix + "r2", r2_score.item(), t_env)
+            
+            print(f"\n[Test Evaluation] World Model Performance at t_env={t_env}:")
+            print(f"  >>> MSE: {masked_mse.item():.6f}")
+            print(f"  >>> R^2: {r2_score.item():.6f}")
+            print("-" * 50)
+
+        # 恢复训练模式
+        self.world_model.train()
 
     def cuda(self):
         self.mac.cuda()

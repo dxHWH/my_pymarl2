@@ -12,11 +12,10 @@ from .fmac_learner import FMACLearner
 from .cf_learner import DMAQ_qattenLearner as CF_Learner
 from .nq_vae_learner import NQLearnerVAE
 from .dvd_learner import DVDNQLearner
-<<<<<<< HEAD
+
 from .dvd_wm_learner import DVDWMLearner  # <--- 新增
 
-=======
->>>>>>> origin/main
+
 
 
 #将不同的learner类注册到REGISTRY字典中
@@ -36,9 +35,7 @@ REGISTRY["fmac_learner"] = FMACLearner
 # REGISTRY["cf_learner"] = CF_Learner
 # REGISTRY["q_with_action_attention_learner"]
 REGISTRY["nq_vae_learner"] = NQLearnerVAE
-<<<<<<< HEAD
+
 REGISTRY["dvd_learner"] = DVDNQLearner
 REGISTRY["dvd_wm_learner"] = DVDWMLearner # <--- 新增
-=======
-REGISTRY["dvd_learner"] = DVDNQLearner
->>>>>>> origin/main
+
