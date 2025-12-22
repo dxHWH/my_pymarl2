@@ -41,6 +41,15 @@ class VAERNNWorldModel(nn.Module):
             nn.Linear(self.rnn_hidden_dim, self.state_dim) # <--- 修正: 输出维度为 state_dim
         )
 
+        # [新增] Reward Predictor
+        # 输入: z_t + h_t
+        # 输出: Predicted Reward
+        self.reward_head = nn.Sequential(
+            nn.Linear(self.latent_dim + self.rnn_hidden_dim, self.rnn_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.rnn_hidden_dim, 1)
+        )
+
     def init_hidden(self, batch_size, device):
         return torch.zeros(batch_size, self.rnn_hidden_dim).to(device)
 
@@ -61,12 +70,13 @@ class VAERNNWorldModel(nn.Module):
         z = mu.unsqueeze(0) + eps * std.unsqueeze(0) 
         return z
 
-    def compute_loss(self, z_samples, hidden_state, target_state, dist_params):
+    def compute_loss(self, z_samples, hidden_state, target_state, dist_params, target_reward=None):
         """
         z_samples: [D, B, Latent]
         hidden_state: [B, Hidden]
         target_state: [B, State_Dim] (真实发生的 Next State)
         dist_params: (mu, logvar)
+        target_reward: [B, 1] (可选，真实奖励)
         """
         mu, logvar = dist_params
         
@@ -88,9 +98,17 @@ class VAERNNWorldModel(nn.Module):
         # KL Divergence Loss
         # VAE 正则项: 限制分布接近 N(0, 1)
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+
+        # [新增 Trick 1] Reward Prediction Loss
+        reward_loss = torch.zeros_like(recon_loss)
+        if target_reward is not None:
+            pred_reward = self.reward_head(inp) # [B, 1]
+            # 计算 MSE Loss, 保持维度 [B, 1] -> [B]
+            r_loss = F.mse_loss(pred_reward, target_reward, reduction='none').squeeze(-1)
+            reward_loss = r_loss
         
-        return recon_loss, kl_loss
-    # 文件: src/modules/world_models/vae_rnn.py
+        return recon_loss, kl_loss, reward_loss
+    
 
 
 

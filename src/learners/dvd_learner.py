@@ -95,7 +95,6 @@ class DVDNQLearner:
                 target_hidden_states_list.append(cur_target_h)
 
             target_mac_out = th.stack(target_mac_out, dim=1)
-
             whole_target_hidden_states = th.stack(target_hidden_states_list, dim=1)
 
             mac_out_detach = mac_out.clone().detach()
@@ -103,22 +102,45 @@ class DVDNQLearner:
             cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
             
+            # ================= [修复 v2: Slicing + Padding] =================
             if self.args.mixer == "dvd":
-                target_max_qvals = self.target_mixer(target_max_qvals, batch["state"], whole_target_hidden_states)
+                # 1. 准备数据：取 t=1 到 T (即 Next States)
+                target_max_qvals_sliced = target_max_qvals[:, 1:]
+                state_sliced = batch["state"][:, 1:]
+                hidden_sliced = whole_target_hidden_states[:, 1:]
+                
+                # 2. 计算 Mixer 输出 (结果长度为 T-1)
+                target_qs_out = self.target_mixer(target_max_qvals_sliced, state_sliced, hidden_sliced)
+                
+                # 3. 填充 Padding: 在 t=0 处补全，使其长度恢复为 T
+                # 这样 target_qs_out[:, 1] 就是 Q(s_1)，符合 build_targets 的预期
+                padding = th.zeros(target_qs_out.shape[0], 1, target_qs_out.shape[2]).to(self.device)
+                target_max_qvals = th.cat([padding, target_qs_out], dim=1)
             else:
                 target_max_qvals = self.target_mixer(target_max_qvals, batch["state"])
 
             if getattr(self.args, 'q_lambda', False):
                 qvals = th.gather(target_mac_out, 3, batch["actions"]).squeeze(3)
+                
                 if self.args.mixer == "dvd":
-                    qvals = self.target_mixer(qvals, batch["state"], whole_target_hidden_states)
+                    # 对 Q-Lambda 分支应用同样的逻辑
+                    qvals_sliced = qvals[:, 1:]
+                    state_sliced = batch["state"][:, 1:]
+                    hidden_sliced = whole_target_hidden_states[:, 1:]
+                    
+                    qvals_out = self.target_mixer(qvals_sliced, state_sliced, hidden_sliced)
+                    
+                    padding = th.zeros(qvals_out.shape[0], 1, qvals_out.shape[2]).to(self.device)
+                    qvals = th.cat([padding, qvals_out], dim=1)
                 else:
                     qvals = self.target_mixer(qvals, batch["state"])
+                    
                 targets = build_q_lambda_targets(rewards, terminated, mask, target_max_qvals, qvals,
                                     self.args.gamma, self.args.td_lambda)
             else:
                 targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
                                             self.args.n_agents, self.args.gamma, self.args.td_lambda)
+            # ================= [修复结束] =================
 
         if self.args.mixer == "dvd":
             chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1], hidden_states_main)

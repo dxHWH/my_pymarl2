@@ -93,7 +93,8 @@ class DVDWMLearner:
         # 初始化 Hidden State (Batch Size 维度)
         wm_hidden = self.world_model.init_hidden(bs, self.device)
         
-        recon_losses, kl_losses, z_history = [], [], []
+        recon_losses, kl_losses, reward_losses = [], [], []
+        z_history = []
 
         for t in range(batch.max_seq_length):
             # 1. WM Step
@@ -107,11 +108,21 @@ class DVDWMLearner:
             if t < batch.max_seq_length - 1:
                 # 预测目标: 下一时刻的 Global State
                 target_state = batch["state"][:, t+1]
-                
+                target_reward = batch["reward"][:, t] # [新增] 获取对应时间步的奖励
+
+                                
                 # 计算 Loss (Recon State + KL)
-                r_l, k_l = self.world_model.compute_loss(z_samples, wm_hidden, target_state, dist_params)
+                # r_l, k_l = self.world_model.compute_loss(z_samples, wm_hidden, target_state, dist_params)
+
+                # [修改] 传入 target_reward 并接收 rew_l
+                r_l, k_l, rew_l = self.world_model.compute_loss(
+                    z_samples, wm_hidden, target_state, dist_params, target_reward
+                )
+
+
                 recon_losses.append(r_l)
                 kl_losses.append(k_l)
+                reward_losses.append(rew_l)
 
         # Aggregate WM Loss
         # Stack: [T-1, B] -> Transpose: [B, T-1]
@@ -129,13 +140,19 @@ class DVDWMLearner:
         # z_history list: T * [D, B, L]
         # Stack -> [T, D, B, L] -> Permute -> [D, B, T, L]
         # 注意: 这里不再有 Agent 维度，因为 Z 是 Global 的
-        z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3) 
+        z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3)
+        # [修改后] 添加 .detach()
+        # 解释: .detach() 会创建一个新的 Tensor，其数值相同但 requires_grad=False。
+        # 这样 loss_td.backward() 更新 Mixer 参数时，梯度传到这里就会停止，不会流向 World Model。
+        # z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3).detach()
         
         z_eval = z_tensor[:, :, :-1]
         z_target = z_tensor[:, :, 1:]
-        
+
         # Mixer Forward (State + Z)
+        # 这里的 z_eval 已经是 detached 的了，所以 Mixer 的梯度不会传给 WM
         chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1], z_eval)
+        
         
         with th.no_grad():
             # target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:], z_target)
