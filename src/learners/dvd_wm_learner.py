@@ -140,14 +140,29 @@ class DVDWMLearner:
         # z_history list: T * [D, B, L]
         # Stack -> [T, D, B, L] -> Permute -> [D, B, T, L]
         # 注意: 这里不再有 Agent 维度，因为 Z 是 Global 的
-        z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3)
+        # z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3)
         # [修改后] 添加 .detach()
         # 解释: .detach() 会创建一个新的 Tensor，其数值相同但 requires_grad=False。
         # 这样 loss_td.backward() 更新 Mixer 参数时，梯度传到这里就会停止，不会流向 World Model。
-        # z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3).detach()
+        z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3).detach()
         
-        z_eval = z_tensor[:, :, :-1]
-        z_target = z_tensor[:, :, 1:]
+        
+        # === 修改 3: Z-Warmup 实现 (Scheme 3) ===
+        # 默认不缩放
+        warmup_coef = 1.0 
+        
+        if getattr(self.args, "use_z_warmup", False):
+            if t_env < self.args.z_warmup_steps:
+                warmup_coef = float(t_env) / float(self.args.z_warmup_steps)
+            else:
+                warmup_coef = 1.0
+        
+        # 应用 Warmup 系数到传入 Mixer 的 Z 上
+        # 注意：这不会影响 World Model 的 loss 计算 (KL/Recon)，只影响 Mixer 的输入
+        z_tensor_mixer = z_tensor * warmup_coef
+
+        z_eval = z_tensor_mixer[:, :, :-1]
+        z_target = z_tensor_mixer[:, :, 1:]
 
         # Mixer Forward (State + Z)
         # 这里的 z_eval 已经是 detached 的了，所以 Mixer 的梯度不会传给 WM
@@ -159,7 +174,7 @@ class DVDWMLearner:
 
             # [修复后代码] 
             # 对 target_max_qvals 进行切片 [:, 1:]，对应 t=1 到 t=T，与 state[:, 1:] 对齐
-            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"], z_tensor)
+            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"], z_tensor_mixer)
             
             if getattr(self.args, 'q_lambda', False):
                  pass 
