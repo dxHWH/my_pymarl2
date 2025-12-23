@@ -1,7 +1,7 @@
 from .vae_rnn import VAERNNWorldModel
-# from .rssm import RSSMWorldModel  <-- 未来这一行解开注释即可
+from .rssm_model import RSSMWorldModel  
 
 REGISTRY = {}
 
 REGISTRY["vae_rnn"] = VAERNNWorldModel
-# REGISTRY["rssm"] = RSSMWorldModel
+REGISTRY["rssm"] = RSSMWorldModel

@@ -14,6 +14,7 @@ from .nq_vae_learner import NQLearnerVAE
 from .dvd_learner import DVDNQLearner
 
 from .dvd_wm_learner import DVDWMLearner  # <--- 新增
+from .dvd_rssm_learner import DVDRssmLearner
 
 
 
@@ -38,4 +39,5 @@ REGISTRY["nq_vae_learner"] = NQLearnerVAE
 
 REGISTRY["dvd_learner"] = DVDNQLearner
 REGISTRY["dvd_wm_learner"] = DVDWMLearner # <--- 新增
+REGISTRY["dvd_rssm_learner"] = DVDrsmmLearner
 
