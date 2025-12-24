@@ -159,29 +159,47 @@ class DVDRssmLearner:
         
         z_tensor_mixer = z_tensor * warmup_coef
 
-        # [Critical Fix]: 严格切片对齐
-        # z_eval:   0 ... T-1 (对应 state[:, :-1])
-        # z_target: 1 ... T   (对应 state[:, 1:])
-        z_eval = z_tensor_mixer[:, :, :-1]
-        z_target = z_tensor_mixer[:, :, 1:]
-
+        # [Final Correct Alignment]
+        # 目标：对齐到 T-1 (即 0..T-2 索引，共 T-1 个时间步)
+        # 假设 max_seq_length=T. 
+        # chosen_action_qvals 长度为 T-1 (0..T-2).
+        # z_tensor 长度为 T+1 (0..T).
+        
+        # 1. Prepare Eval inputs
+        # z_eval 需要 0..T-2.
+        # 切片 [:-2] 正好去掉最后两个 (T-1 和 T)，剩下 0..T-2.
+        z_eval = z_tensor_mixer[:, :, :-2]
+        
         # Mixer Forward (Current Q)
+        # chosen_action_qvals 和 batch["state"][:, :-1] 已经是 T-1 长度，直接使用，无需再切片
         chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1], z_eval)
         
         with th.no_grad():
-            # [Critical Fix]: Target Q 切片
-            # target_max_qvals 原本是 0...T，我们需要 1...T
+            # 2. Prepare Target inputs
+            # z_target 需要 1..T-1 (对应 s_1..s_{T-1}).
+            # 切片 [1:-1] 去掉头(0)和尾(T)，剩下 1..T-1.
+            z_target = z_tensor_mixer[:, :, 1:-1]
+            
+            # Target Qs (from target_mac_out [0..T-1]).
+            # 我们需要 1..T-1. 切片 [1:].
             target_max_qvals_next = target_max_qvals[:, 1:]
             
-            # Target Mixer 输入
-            target_max_qvals = self.target_mixer(target_max_qvals_next, batch["state"][:, 1:], z_target)
+            # Target State [1..T-1]. 切片 batch["state"][:, 1:]
+            target_state = batch["state"][:, 1:]
+            
+            # Target Mixer Input
+            target_max_qvals = self.target_mixer(target_max_qvals_next, target_state, z_target)
             
             if getattr(self.args, 'q_lambda', False):
                  pass 
             else:
+                # 注意：这里不需要再对 rewards/terminated/mask 进行额外切片
+                # 它们原本就是 [:, :-1]，长度为 T-1，正好与 target_max_qvals 匹配
                 targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
                                             self.args.n_agents, self.args.gamma, self.args.td_lambda)
 
+        # 3. Calculate Loss
+        # 现在两者应该都是 T-1 长度 (例如 70)
         td_error = (chosen_action_qvals - targets.detach())
         loss_td = (td_error ** 2 * mask.expand_as(td_error)).sum() / mask.sum()
         
