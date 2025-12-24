@@ -7,7 +7,7 @@ import torch as th
 from torch.optim import RMSprop, Adam
 import torch.nn.functional as F
 
-class DVDRssmLearner:
+class DVDRssmLearnerOrigin:
     def __init__(self, mac, scheme, logger, args):
         self.args = args
         self.mac = mac
@@ -24,7 +24,7 @@ class DVDRssmLearner:
 
         # 2. 初始化 World Model (全局模式)
         # Input = Global State + Joint Actions (All Agents)
-        self.state_dim = int(args.state_shape) if isinstance(args.state_shape, int) else int(args.state_shape[0])
+        self.state_dim = int(args.state_shape) if isinstance(args.state_shape, int) else int(args.state_shape[0]) # 处理可能的shape格式
         self.n_actions = args.n_actions
         self.n_agents = args.n_agents
         
@@ -73,16 +73,14 @@ class DVDRssmLearner:
             for t in range(batch.max_seq_length):
                 target_agent_outs = self.target_mac.forward(batch, t=t)
                 target_mac_out.append(target_agent_outs)
-            # [注意] 这里先保留完整序列 0..T，后面在计算 Target 时再切片 [1:]
             target_mac_out = th.stack(target_mac_out, dim=1)
             
             mac_out_detach = mac_out.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
-            # Double Q 选择动作
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
 
-        # ==================== World Rollout & Latent Extraction ====================
+        # ==================== World Rollout (Modified for RSSM) ====================
         bs = batch.batch_size
         
         # 1. 构建输入: Global State + Joint Actions
@@ -92,89 +90,102 @@ class DVDRssmLearner:
         # 初始化 Hidden State
         wm_hidden = self.world_model.init_hidden(bs, self.device)
         
-        z_history = []          # 用于存储传给 Mixer 的 z [0...T]
-        forward_outputs = []    # 用于存储 RSSM 的中间输出以便计算 Loss
+        z_history = []          # 用于存储传给 Mixer 的 z
+        forward_outputs = []    # [新增] 用于存储 RSSM 的中间输出 (h, post, prior 等) 以便计算 Loss
 
-        # [Phase 1]: 主循环 (处理 t=0 到 T-1)
-        # 这一步产生 h_1...h_T 和 z_0...z_{T-1}
+        # 循环 t
         for t in range(batch.max_seq_length):
             # 1. WM Step (Forward)
-            # wm_hidden 在输入时是 h_t, 输出时更新为 h_{t+1}
+            # RSSM 的 forward_step 返回: next_hidden, dist_params
+            # 注意: 这里的 dist_params 包含了 (prior, post, z) 等复杂结构
             wm_hidden, dist_params = self.world_model.forward_step(wm_inputs[:, t], wm_hidden)
             
             # 2. 收集输出供后续计算 Loss
             forward_outputs.append((wm_hidden, dist_params))
 
-            # 3. Sample Z for Mixer 
-            # 这里的 sample_latents 已经在 rssm_model.py 中修复为使用 [h_t, z_t]
-            z_feature = self.world_model.sample_latents(dist_params, num_samples=self.args.dvd_samples)
-            z_history.append(z_feature)
+            # 3. Sample Z for Mixer (使用 sample_latents 接口适配)
+            # 这里的 z_samples 已经是拼接好 [h, z] 的特征了 (如果使用我之前给的 RSSM 代码)
+            z_samples = self.world_model.sample_latents(dist_params, num_samples=self.args.dvd_samples)
+            z_history.append(z_samples)
 
-        # [Phase 2]: 补全最后一步 (处理 t=T) [Critical Fix!]
-        # 此时循环结束，wm_hidden 是 h_T
-        # 我们需要计算 z_T (对应 state[:, -1]) 用于 Target Network 的最后一步输入
-        # 因为没有 a_T，无法更新 RNN 到 h_{T+1}，但可以推断后验 z_T
+        # ==================== World Model Loss Calculation (Batch) ====================
+        # 这里的逻辑发生了变化：我们在循环外统一计算 Loss
         
-        last_state = batch["state"][:, -1] # s_T
-        # 调用 RSSM 的 infer_posterior 辅助函数 (需确保 rssm_model.py 已更新)
-        z_T_params = self.world_model.infer_posterior(wm_hidden, last_state) 
-        
-        # 手动拼接 [h_T, z_T]
-        # 注意保持维度一致: [1, B, Latent]
-        z_T_feature = th.cat([wm_hidden, z_T_params['z']], dim=-1).unsqueeze(0)
-        z_history.append(z_T_feature)
-
-        # ==================== World Model Loss Calculation ====================
-        # 依然只计算前 T-1 步的预测 Loss (预测 1...T)
+        # 准备真实标签 (Targets)
+        # 我们用 t=0 的输入预测 t=1 的状态，所以 Target 是 state[:, 1:]
+        # forward_outputs 包含 t=0 到 t=T-1 的输出 (共 T 个)
+        # 但有效的预测通常直到 T-1 (因为 batch["state"] 长度为 T)
+        # 确保对齐：取前 T-1 个输出，对应 batch["state"][:, 1:]
         
         seq_len = batch.max_seq_length
         if seq_len > 1:
+            # 取出前 T-1 个时间步的预测输出
             valid_outputs = forward_outputs[:-1] 
-            target_states = batch["state"][:, 1:] # s_1 ... s_T
-            target_rewards = batch["reward"][:, :-1] # r_0 ... r_{T-1}
+            
+            # 对应的真实标签: State_{1} 到 State_{T-1}
+            target_states = batch["state"][:, 1:]
+            
+            # 对应的真实奖励: Reward_{0} 到 Reward_{T-2} (PyMARL 的 reward 对齐比较特殊，通常 r_t 是 s_t 采取 a_t 后的奖励)
+            # batch["reward"][:, :-1] 对应 0 到 T-2
+            target_rewards = batch["reward"][:, :-1]
 
+            # 统一计算 Loss
+            # RSSM 的 compute_loss 内部处理时间维度
             recon_loss, kl_loss, reward_loss = self.world_model.compute_loss(
                 valid_outputs, target_states, target_rewards
             )
             
-            mask_squeeze = mask.squeeze(-1) # [B, T-1]
+            # 应用 Mask (mask 的维度通常是 [B, T-1])
+            mask_squeeze = mask.squeeze(-1) 
+            
+            # 确保 loss 维度与 mask 一致 [B, T-1]
+            # 如果 compute_loss 返回的是 [B, T-1]，则直接相乘
             
             wm_loss = (recon_loss * mask_squeeze).sum() / mask_squeeze.sum() + \
                       self.args.wm_kl_beta * (kl_loss * mask_squeeze).sum() / mask_squeeze.sum() + \
                       (reward_loss * mask_squeeze).sum() / mask_squeeze.sum()
         else:
             wm_loss = th.tensor(0.0).to(self.device)
-
         # ==================== Mixing & RL Loss ====================
-        
-        # Stack Z: [T+1, D, B, L] -> [D, B, T+1, L]
-        # 现在 z_tensor 的长度是 T+1 (0...T)
+        # Prepare Z
+        # z_history list: T * [D, B, L]
+        # Stack -> [T, D, B, L] -> Permute -> [D, B, T, L]
+        # 注意: 这里不再有 Agent 维度，因为 Z 是 Global 的
+        # z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3)
+        # [修改后] 添加 .detach()
+        # 解释: .detach() 会创建一个新的 Tensor，其数值相同但 requires_grad=False。
+        # 这样 loss_td.backward() 更新 Mixer 参数时，梯度传到这里就会停止，不会流向 World Model。
         z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3).detach()
         
-        # --- Z-Warmup (Trick) ---
+        
+        # === 修改 3: Z-Warmup 实现 (Scheme 3) ===
+        # 默认不缩放
         warmup_coef = 1.0 
+        
         if getattr(self.args, "use_z_warmup", False):
             if t_env < self.args.z_warmup_steps:
                 warmup_coef = float(t_env) / float(self.args.z_warmup_steps)
+            else:
+                warmup_coef = 1.0
         
+        # 应用 Warmup 系数到传入 Mixer 的 Z 上
+        # 注意：这不会影响 World Model 的 loss 计算 (KL/Recon)，只影响 Mixer 的输入
         z_tensor_mixer = z_tensor * warmup_coef
 
-        # [Critical Fix]: 严格切片对齐
-        # z_eval:   0 ... T-1 (对应 state[:, :-1])
-        # z_target: 1 ... T   (对应 state[:, 1:])
         z_eval = z_tensor_mixer[:, :, :-1]
         z_target = z_tensor_mixer[:, :, 1:]
 
-        # Mixer Forward (Current Q)
+        # Mixer Forward (State + Z)
+        # 这里的 z_eval 已经是 detached 的了，所以 Mixer 的梯度不会传给 WM
         chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1], z_eval)
         
+        
         with th.no_grad():
-            # [Critical Fix]: Target Q 切片
-            # target_max_qvals 原本是 0...T，我们需要 1...T
-            target_max_qvals_next = target_max_qvals[:, 1:]
-            
-            # Target Mixer 输入
-            target_max_qvals = self.target_mixer(target_max_qvals_next, batch["state"][:, 1:], z_target)
+            # target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:], z_target)
+
+            # [修复后代码] 
+            # 对 target_max_qvals 进行切片 [:, 1:]，对应 t=1 到 t=T，与 state[:, 1:] 对齐
+            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"], z_tensor_mixer)
             
             if getattr(self.args, 'q_lambda', False):
                  pass 
@@ -226,40 +237,53 @@ class DVDRssmLearner:
         joint_actions = batch["actions_onehot"].reshape(bs, max_t, -1)
         wm_inputs = th.cat([batch["state"], joint_actions], dim=-1)
         
+        # 真实标签 (从 t=1 到 t=T 的状态)
         target_states = batch["state"][:, 1:] 
-        mask = batch["filled"][:, :-1].float().squeeze(-1)
+        mask = batch["filled"][:, :-1].float().squeeze(-1) # [B, T-1] 用于过滤填充数据
 
         # 2. 切换评估模式
         self.world_model.eval()
+        
         pred_states_list = []
         
         with th.no_grad():
             wm_hidden = self.world_model.init_hidden(bs, self.device)
             
+            # 循环预测 t=0 到 t=T-1
             for t in range(max_t - 1):
-                # 预测 t+1
-                # predict 内部已适配 [h_t, z_t] 逻辑
+                # 使用 predict 接口
                 pred_next_state, wm_hidden = self.world_model.predict(
                     wm_inputs[:, t], wm_hidden, use_mean=True
                 )
                 pred_states_list.append(pred_next_state)
             
+            # 堆叠预测结果 [B, T-1, State_Dim]
             pred_states = th.stack(pred_states_list, dim=1)
 
             # 3. 计算指标
+            # (1) MSE (Mean Squared Error)
             errors = (pred_states - target_states) ** 2
+            # 对 State 维度求和/平均 -> [B, T-1]
             mse_per_step = errors.mean(dim=-1) 
+            # 应用 Mask (只计算有效时间步)
             masked_mse = (mse_per_step * mask).sum() / mask.sum()
             
-            # R^2 Score
-            mask_bool = mask.bool()
+            # (2) R^2 Score (Coefficient of Determination)
+            # R2 = 1 - (SS_res / SS_tot)
+            # SS_res = sum((y_true - y_pred)^2)
+            # SS_tot = sum((y_true - y_mean)^2)
+            
+            # 将 Tensor 展平以便计算全局 R2
+            mask_bool = mask.bool() # [B, T-1]
+            # 只取有效数据
             y_true_flat = target_states[mask_bool.unsqueeze(-1).expand_as(target_states)].reshape(-1, self.state_dim)
             y_pred_flat = pred_states[mask_bool.unsqueeze(-1).expand_as(pred_states)].reshape(-1, self.state_dim)
             
             ss_res = ((y_true_flat - y_pred_flat) ** 2).sum()
-            y_mean = y_true_flat.mean(dim=0)
+            y_mean = y_true_flat.mean(dim=0) # 对每个状态特征维度求均值
             ss_tot = ((y_true_flat - y_mean) ** 2).sum()
             
+            # 避免除以零
             if ss_tot.item() == 0:
                 r2_score = 0.0
             else:
@@ -275,6 +299,7 @@ class DVDRssmLearner:
             print(f"  >>> R^2: {r2_score.item():.6f}")
             print("-" * 50)
 
+        # 恢复训练模式
         self.world_model.train()
 
     def cuda(self):

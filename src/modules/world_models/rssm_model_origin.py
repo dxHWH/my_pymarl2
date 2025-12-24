@@ -3,14 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
-class RSSMWorldModel(nn.Module):
+class RSSMWorldModelorigin(nn.Module):
     def __init__(self, input_dim, args):
-        super(RSSMWorldModel, self).__init__()
+        super(RSSMWorldModelorigin, self).__init__()
         self.args = args
         self.device = torch.device('cuda' if args.use_cuda else 'cpu')
 
         # === 1. 维度解析 ===
         # input_dim = State_Dim + (N_Agents * N_Actions)
+        # 我们需要手动拆分，因为 RSSM 对 State 和 Action 的处理方式不同
         if isinstance(args.state_shape, int):
             self.state_dim = args.state_shape
         else:
@@ -18,10 +19,10 @@ class RSSMWorldModel(nn.Module):
             
         self.action_dim = args.n_agents * args.n_actions
         
-        # 验证维度
+        # 验证维度 (Learner 传入的 input_dim 应该是两者之和)
         assert input_dim == self.state_dim + self.action_dim, "RSSM Input dim mismatch!"
 
-        # RSSM 专属维度配置
+        # RSSM 专属维度配置 (需要在 yaml 中定义)
         self.hidden_dim = args.rssm_hidden_dim  # Deterministic h_t
         self.latent_dim = args.rssm_latent_dim  # Stochastic z_t
         self.embed_dim = getattr(args, "rssm_embed_dim", 256)
@@ -40,7 +41,8 @@ class RSSMWorldModel(nn.Module):
         )
 
         # (b) Recurrent Model (Deterministic Path): h_t -> h_{t+1}
-        # Input: h_t, z_t, a_t (Input is concat of z and a)
+        # Input: h_t, z_t, a_t
+        # Update: h_{t+1} = GRU(h_t, concat(z_t, a_t))
         self.rnn_cell = nn.GRUCell(self.latent_dim + self.embed_dim, self.hidden_dim)
 
         # (c) Transition Model (Prior): p(z_t | h_t)
@@ -59,8 +61,9 @@ class RSSMWorldModel(nn.Module):
             nn.Linear(self.embed_dim, 2 * self.latent_dim) # Mean + LogVar
         )
 
-        # (e) State Predictor (Decoder): Predict S_{t+1} from h_{t+1} and z_t
-        # h_{t+1} 包含了 a_t，是预测下一帧的关键
+        # (e) State Predictor (Decoder): Predict S_{t+1} from h_{t+1} (and z_{t+1} sampled from prior)
+        # 简单起见，且为了高效，直接使用 h_{t+1} 预测 S_{t+1}
+        # h_{t+1} 已经聚合了 (h_t, z_t, a_t)，包含了预测下一帧所需的所有信息
         self.decoder = nn.Sequential(
             nn.Linear(self.hidden_dim + self.latent_dim, self.embed_dim),
             nn.ELU(),
@@ -82,7 +85,7 @@ class RSSMWorldModel(nn.Module):
 
     def forward_step(self, obs_input, prev_rnn_state):
         """
-        单步前向传播 (Step t)
+        单步前向传播
         obs_input: [B, State + Action] -> 当前时刻 t 的观测和动作
         prev_rnn_state: [B, Hidden] -> 上一时刻的确定性状态 h_t
         """
@@ -111,73 +114,79 @@ class RSSMWorldModel(nn.Module):
 
         # 6. Update RNN State (Deterministic Path)
         # h_{t+1} = GRU(h_t, z_t, a_t)
+        # 注意：这里我们使用 action_t 来更新状态到 t+1
         rnn_in = torch.cat([z_t, a_embed], dim=-1)
         next_rnn_state = self.rnn_cell(rnn_in, prev_rnn_state)
 
         # 7. 打包返回
-        # [Critical Change]: 必须返回 prev_rnn_state (h_t) 供 sample_latents 使用
-        # 避免因果泄露 (Causality Leak)
-        return next_rnn_state, (prior_mu, prior_logvar, post_mu, post_logvar, z_t, next_rnn_state, prev_rnn_state)
+        # 我们需要返回 next_hidden 供下一次循环使用
+        # 还需要返回 dist_params 供 compute_loss 使用
+        # 这里的 z_t 将用于 Mixer (通过 sample_latents)
+        
+        # 将 z_t 和 next_rnn_state 打包在 dist_params 里传给 compute_loss
+        # 注意：next_rnn_state 是 h_{t+1}, z_t 是 t 时刻的 latent
+        return next_rnn_state, (prior_mu, prior_logvar, post_mu, post_logvar, z_t, next_rnn_state)
 
     def sample_latents(self, dist_params, num_samples=1):
         """
         返回给 Mixer 使用的特征。
-        为了严格遵守因果性 (Causality) 和 CTDE 假设，
-        必须使用 [h_t, z_t] 而非 [h_{t+1}, z_t]。
+        为了最大化信息量，我们返回 [h_t, z_t] 的拼接。
+        注意：h_t 是 prev_rnn_state，z_t 是当前采样的。
+        但是 forward_step 返回的 hidden 是 next_rnn_state (h_{t+1})。
+        
+        Mixer 需要的是 t 时刻的特征来辅助 Q(t)。
+        z_t 是 t 时刻的。
+        h_{t+1} 包含了 a_t，可能对 Q(t) 来说是未来的信息（如果我们认为 a_t 是 Q 的输出）。
+        但通常 Q(s, a) 依赖 s。
+        
+        此处我们遵循 Dreamer 策略：Policy 输入是 [h_t, z_t]。
+        但在 Learner 循环中，我们刚刚计算完 forward_step，手头有 z_t 和 h_{t+1} (next_rnn_state)。
+        如果要获取 h_t，比较麻烦。
+        
+        **折衷方案**：Mixer 接收 [h_{t+1}, z_t]。
+        理由：h_{t+1} 聚合了历史直到 t，包含了 z_t 和 a_t。这作为 Hypernet 输入是非常丰富的。
         """
-        # 解包 (忽略不需要的部分)
-        _, _, _, _, z_t, next_rnn_state, prev_rnn_state = dist_params
+        # _, _, _, _, z_t, next_rnn_state = dist_params
         
-        # Concat [h_t, z_t]
-        # prev_rnn_state (h_t) 是动作发生前的状态，z_t 是当前的观测特征
-        representation = torch.cat([prev_rnn_state, z_t], dim=-1)
+        # # Concat [h, z]
+        # # 维度变为: rssm_hidden_dim + rssm_latent_dim
+        # representation = torch.cat([next_rnn_state, z_t], dim=-1)
         
-        # 增加维度适配 Learner [D, B, Latent] (D=1 for RSSM)
+        # # 增加维度适配 Learner [D, B, Latent] (D=1)
+        # ---------------------------------------------------------------------
+        # [核心修改点]：解包 6 个参数 (旧版本逻辑)
+        _, _, _, _, z_t, next_rnn_state = dist_params
+        
+        # Concat [h_{t+1}, z_t] (这是 Origin 版本的逻辑，包含未来动作信息)
+        representation = torch.cat([next_rnn_state, z_t], dim=-1)
+        
         return representation.unsqueeze(0)
-
-    def infer_posterior(self, hidden_state, state):
-        """
-        辅助函数：仅推断后验 z_t，不更新 RNN。
-        用于 Learner 在处理序列最后一步 (T) 时，补全 z_T。
-        此时只有 s_T，没有 a_T，无法计算 h_{T+1}。
-        """
-        s_embed = self.state_encoder(state)
-        
-        # q(z_T | h_T, s_T)
-        post_in = torch.cat([hidden_state, s_embed], dim=-1)
-        post_stats = self.posterior_net(post_in)
-        post_mu, post_logvar = torch.chunk(post_stats, 2, dim=-1)
-        
-        z_t = self._sample_z(post_mu, post_logvar)
-        
-        return {
-            'z': z_t,
-            'mu': post_mu,
-            'logvar': post_logvar
-        }
 
     def compute_loss(self, forward_outputs_list, target_states, target_rewards=None):
         """
-        批量计算整个序列的 Loss
+        [修复]: 修改为接收 list 输入，适配 Learner 的批量调用。
         """
         prior_means, prior_logvars = [], []
         post_means, post_logvars = [], []
         z_samples = []
-        h_nexts = [] # h_{t+1} 用于 Decoder 重建 s_{t+1}
+        h_nexts = []
 
+        # 遍历时间步输出
         for out in forward_outputs_list:
-            _, params = out
-            # 解包所有参数
-            p_mu, p_lv, q_mu, q_lv, z, h_next, h_prev = params
+            # Learner 传过来的是 (wm_hidden, dist_params)
+            _, dist_params = out
             
-            prior_means.append(p_mu)
-            prior_logvars.append(p_lv)
-            post_means.append(q_mu)
-            post_logvars.append(q_lv)
-            z_samples.append(z)
+            # 解包 6 个参数 (Origin 版本)
+            prior_mu, prior_logvar, post_mu, post_logvar, z_t, h_next = dist_params
+            
+            prior_means.append(prior_mu)
+            prior_logvars.append(prior_logvar)
+            post_means.append(post_mu)
+            post_logvars.append(post_logvar)
+            z_samples.append(z_t)
             h_nexts.append(h_next)
 
-        # Stack Time dimension [B, T, ...]
+        # 堆叠时间维度 [B, T, ...]
         h_next = torch.stack(h_nexts, dim=1)
         z = torch.stack(z_samples, dim=1)
         p_mu = torch.stack(prior_means, dim=1)
@@ -185,40 +194,24 @@ class RSSMWorldModel(nn.Module):
         q_mu = torch.stack(post_means, dim=1)
         q_lv = torch.stack(post_logvars, dim=1)
 
-        # 1. Reconstruction Loss (Predict S_{t+1})
-        # 使用 h_{t+1} (包含 a_t) 和 z_t 来预测
+        # 1. Reconstruction Loss
+        # Origin 版本使用 h_{t+1} 和 z_t 重建 s_{t+1}
         dec_in = torch.cat([h_next, z], dim=-1)
         pred_next_state = self.decoder(dec_in)
         
         recon_loss = F.mse_loss(pred_next_state, target_states, reduction='none').mean(dim=-1)
 
-        # 2. KL Divergence Loss
+        # 2. KL Loss
         kl_loss = self._kl_divergence(q_mu, q_lv, p_mu, p_lv)
 
-        # 3. Reward Prediction Loss
+        # 3. Reward Loss
         reward_loss = torch.zeros_like(recon_loss)
         if target_rewards is not None:
             pred_rew = self.reward_head(dec_in)
             reward_loss = F.mse_loss(pred_rew, target_rewards, reduction='none').squeeze(-1)
 
         return recon_loss, kl_loss, reward_loss
-
-    def predict(self, obs_input, hidden_state, use_mean=True):
-        """
-        用于评估时的单步预测
-        """
-        next_hidden, params = self.forward_step(obs_input, hidden_state)
-        # 解包 (注意结构已变)
-        _, _, post_mu, post_logvar, z_t, h_next, h_prev = params
-        
-        # 评估时通常使用均值
-        z = post_mu if use_mean else z_t
-            
-        dec_in = torch.cat([h_next, z], dim=-1)
-        pred_next_state = self.decoder(dec_in)
-        
-        return pred_next_state, next_hidden
-
+    
     def _sample_z(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
@@ -229,4 +222,25 @@ class RSSMWorldModel(nn.Module):
         var1 = torch.exp(lv1)
         var2 = torch.exp(lv2)
         kl = 0.5 * (var1 / var2 + (mu2 - mu1)**2 / var2 - 1 + lv2 - lv1)
-        return kl.sum(dim=-1)
+        return kl.sum(dim=-1) # Sum over latent dim
+
+    def predict(self, obs_input, hidden_state, use_mean=True):
+        """
+        用于评估时的单步预测
+        """
+        # RSSM 的 predict 需要维护 h 和 z
+        # 这里为了适配 learner.evaluate_world_model 的简单接口
+        # 我们执行一步 forward
+        next_hidden, params = self.forward_step(obs_input, hidden_state)
+        _, _, post_mu, post_logvar, z_t, h_next = params
+        
+        # 如果是评估，通常使用 Mean
+        if use_mean:
+            z = post_mu
+        else:
+            z = z_t
+            
+        dec_in = torch.cat([h_next, z], dim=-1)
+        pred_next_state = self.decoder(dec_in)
+        
+        return pred_next_state, next_hidden
