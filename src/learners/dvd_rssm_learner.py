@@ -48,12 +48,16 @@ class DVDRssmLearner:
         self.log_stats_t = -self.args.learner_log_interval - 1
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, per_weight=None):
-        rewards = batch["reward"][:, :-1]
-        actions = batch["actions"][:, :-1]
+        # PyMARL standard: max_seq_length = T
+        # Valid transitions: 0 -> 1, ..., T-2 -> T-1 (Total T-1 steps)
+        max_seq_length = batch.max_seq_length 
+        
+        rewards = batch["reward"][:, :-1]      # [B, T-1, 1]
+        actions = batch["actions"][:, :-1]     # [B, T-1, ...]
         terminated = batch["terminated"][:, :-1].float()
         mask = batch["filled"][:, :-1].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        avail_actions = batch["avail_actions"]
+        avail_actions = batch["avail_actions"] # [B, T, ...]
 
         # --- Forward Pass: RL Agent ---
         self.mac.agent.train()
@@ -62,10 +66,13 @@ class DVDRssmLearner:
         for t in range(batch.max_seq_length):
             agent_outs = self.mac.forward(batch, t=t)
             mac_out.append(agent_outs)
-        mac_out = th.stack(mac_out, dim=1)
-        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
+        mac_out = th.stack(mac_out, dim=1) # [B, T, Agents, Actions]
+
+        # Chosen Q (Current Step): 0...T-2
+        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3) # [B, T-1, Agents]
 
         # --- Forward Pass: Target Network ---
+        # Calculate for FULL sequence (0...T-1) to allow TD-Lambda shifting
         with th.no_grad():
             self.target_mac.agent.train()
             target_mac_out = []
@@ -73,151 +80,118 @@ class DVDRssmLearner:
             for t in range(batch.max_seq_length):
                 target_agent_outs = self.target_mac.forward(batch, t=t)
                 target_mac_out.append(target_agent_outs)
-            # [注意] 这里先保留完整序列 0..T，后面在计算 Target 时再切片 [1:]
-            target_mac_out = th.stack(target_mac_out, dim=1)
+            target_mac_out = th.stack(target_mac_out, dim=1) # [B, T, Agents, Actions]
             
+            # Double Q-Learning
             mac_out_detach = mac_out.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
-            # Double Q 选择动作
-            target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
+            target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3) # [B, T, Agents]
 
-        # ==================== World Rollout & Latent Extraction ====================
+        # ==================== World Rollout ====================
         bs = batch.batch_size
+        joint_actions = batch["actions_onehot"].reshape(bs, max_seq_length, -1)
+        wm_inputs = th.cat([batch["state"], joint_actions], dim=-1)
         
-        # 1. 构建输入: Global State + Joint Actions
-        joint_actions = batch["actions_onehot"].reshape(bs, batch.max_seq_length, -1)
-        wm_inputs = th.cat([batch["state"], joint_actions], dim=-1) # [B, T, State + N*A]
-        
-        # 初始化 Hidden State
         wm_hidden = self.world_model.init_hidden(bs, self.device)
-        
-        z_history = []          # 用于存储传给 Mixer 的 z [0...T]
-        forward_outputs = []    # 用于存储 RSSM 的中间输出以便计算 Loss
+        z_history = [] 
+        forward_outputs = []
 
-        # [Phase 1]: 主循环 (处理 t=0 到 T-1)
-        # 这一步产生 h_1...h_T 和 z_0...z_{T-1}
-        for t in range(batch.max_seq_length):
-            # 1. WM Step (Forward)
-            # wm_hidden 在输入时是 h_t, 输出时更新为 h_{t+1}
+        # Generate z for full sequence 0...T-1
+        for t in range(max_seq_length):
             wm_hidden, dist_params = self.world_model.forward_step(wm_inputs[:, t], wm_hidden)
-            
-            # 2. 收集输出供后续计算 Loss
             forward_outputs.append((wm_hidden, dist_params))
-
-            # 3. Sample Z for Mixer 
-            # 这里的 sample_latents 已经在 rssm_model.py 中修复为使用 [h_t, z_t]
             z_feature = self.world_model.sample_latents(dist_params, num_samples=self.args.dvd_samples)
             z_history.append(z_feature)
 
-        # [Phase 2]: 补全最后一步 (处理 t=T) [Critical Fix!]
-        # 此时循环结束，wm_hidden 是 h_T
-        # 我们需要计算 z_T (对应 state[:, -1]) 用于 Target Network 的最后一步输入
-        # 因为没有 a_T，无法更新 RNN 到 h_{T+1}，但可以推断后验 z_T
+        # z_tensor: [D, B, T, L]
+        z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3).detach()
         
-        last_state = batch["state"][:, -1] # s_T
-        # 调用 RSSM 的 infer_posterior 辅助函数 (需确保 rssm_model.py 已更新)
-        z_T_params = self.world_model.infer_posterior(wm_hidden, last_state) 
-        
-        # 手动拼接 [h_T, z_T]
-        # 注意保持维度一致: [1, B, Latent]
-        z_T_feature = th.cat([wm_hidden, z_T_params['z']], dim=-1).unsqueeze(0)
-        z_history.append(z_T_feature)
+        warmup_coef = 1.0 
+        if getattr(self.args, "use_z_warmup", False):
+            if t_env < self.args.z_warmup_steps:
+                warmup_coef = float(t_env) / float(self.args.z_warmup_steps)
+        z_tensor_mixer = z_tensor * warmup_coef
 
-        # ==================== World Model Loss Calculation ====================
-        # 依然只计算前 T-1 步的预测 Loss (预测 1...T)
+        # ==================== Mixing & Targets ====================
         
-        seq_len = batch.max_seq_length
-        if seq_len > 1:
+        # 1. Mixer (Current Steps): 0...T-2
+        # Inputs must be sliced to T-1
+        z_eval = z_tensor_mixer[:, :, :-1] # [D, B, T-1, L]
+        chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1], z_eval)
+
+        # 2. Target Mixer (All Steps): 0...T-1
+        # [CRITICAL FIX] 传入完整序列，让 build_td_lambda_targets 处理偏移
+        with th.no_grad():
+            z_target_full = z_tensor_mixer # [D, B, T, L]
+            target_state_full = batch["state"] # [B, T, S]
+            target_max_qvals_full = target_max_qvals # [B, T, Agents]
+            
+            # Output: [B, T, 1]
+            target_mixed_qvals = self.target_mixer(target_max_qvals_full, target_state_full, z_target_full)
+            
+            # 3. Calculate TD Targets
+            # rewards: [B, T-1, 1]
+            # target_mixed: [B, T, 1] (uses indices t+1 for t)
+            # Returns: [B, T-1, 1]
+            targets = build_td_lambda_targets(
+                rewards, 
+                terminated, 
+                mask, 
+                target_mixed_qvals, 
+                self.args.n_agents, 
+                self.args.gamma, 
+                self.args.td_lambda
+            )
+
+        # 4. RL Loss Calculation
+        # chosen: [B, T-1, 1] - targets: [B, T-1, 1]
+        td_error = (chosen_action_qvals - targets.detach())
+        
+        # [Safety Clip] 万一仍有微小维度差异（通常不再发生）
+        if td_error.shape[1] != mask.shape[1]:
+             min_len = min(td_error.shape[1], mask.shape[1])
+             td_error = td_error[:, :min_len]
+             mask = mask[:, :min_len]
+        
+        loss_td = (td_error ** 2 * mask.expand_as(td_error)).sum() / mask.sum()
+        
+        # ==================== World Model Loss ====================
+        if max_seq_length > 1:
             valid_outputs = forward_outputs[:-1] 
-            target_states = batch["state"][:, 1:] # s_1 ... s_T
-            target_rewards = batch["reward"][:, :-1] # r_0 ... r_{T-1}
+            target_states = batch["state"][:, 1:] 
+            target_rewards = batch["reward"][:, :-1]
 
             recon_loss, kl_loss, reward_loss = self.world_model.compute_loss(
                 valid_outputs, target_states, target_rewards
             )
             
-            mask_squeeze = mask.squeeze(-1) # [B, T-1]
+            mask_squeeze = mask.squeeze(-1)
             
+            if recon_loss.shape[1] != mask_squeeze.shape[1]:
+                min_wm_len = min(recon_loss.shape[1], mask_squeeze.shape[1])
+                recon_loss = recon_loss[:, :min_wm_len]
+                kl_loss = kl_loss[:, :min_wm_len]
+                reward_loss = reward_loss[:, :min_wm_len]
+                mask_squeeze = mask_squeeze[:, :min_wm_len]
+
             wm_loss = (recon_loss * mask_squeeze).sum() / mask_squeeze.sum() + \
                       self.args.wm_kl_beta * (kl_loss * mask_squeeze).sum() / mask_squeeze.sum() + \
                       (reward_loss * mask_squeeze).sum() / mask_squeeze.sum()
         else:
             wm_loss = th.tensor(0.0).to(self.device)
 
-        # ==================== Mixing & RL Loss ====================
-        
-        # Stack Z: [T+1, D, B, L] -> [D, B, T+1, L]
-        # 现在 z_tensor 的长度是 T+1 (0...T)
-        z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3).detach()
-        
-        # --- Z-Warmup (Trick) ---
-        warmup_coef = 1.0 
-        if getattr(self.args, "use_z_warmup", False):
-            if t_env < self.args.z_warmup_steps:
-                warmup_coef = float(t_env) / float(self.args.z_warmup_steps)
-        
-        z_tensor_mixer = z_tensor * warmup_coef
-
-        # [Final Correct Alignment]
-        # 目标：对齐到 T-1 (即 0..T-2 索引，共 T-1 个时间步)
-        # 假设 max_seq_length=T. 
-        # chosen_action_qvals 长度为 T-1 (0..T-2).
-        # z_tensor 长度为 T+1 (0..T).
-        
-        # 1. Prepare Eval inputs
-        # z_eval 需要 0..T-2.
-        # 切片 [:-2] 正好去掉最后两个 (T-1 和 T)，剩下 0..T-2.
-        z_eval = z_tensor_mixer[:, :, :-2]
-        
-        # Mixer Forward (Current Q)
-        # chosen_action_qvals 和 batch["state"][:, :-1] 已经是 T-1 长度，直接使用，无需再切片
-        chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1], z_eval)
-        
-        with th.no_grad():
-            # 2. Prepare Target inputs
-            # z_target 需要 1..T-1 (对应 s_1..s_{T-1}).
-            # 切片 [1:-1] 去掉头(0)和尾(T)，剩下 1..T-1.
-            z_target = z_tensor_mixer[:, :, 1:-1]
-            
-            # Target Qs (from target_mac_out [0..T-1]).
-            # 我们需要 1..T-1. 切片 [1:].
-            target_max_qvals_next = target_max_qvals[:, 1:]
-            
-            # Target State [1..T-1]. 切片 batch["state"][:, 1:]
-            target_state = batch["state"][:, 1:]
-            
-            # Target Mixer Input
-            target_max_qvals = self.target_mixer(target_max_qvals_next, target_state, z_target)
-            
-            if getattr(self.args, 'q_lambda', False):
-                 pass 
-            else:
-                # 注意：这里不需要再对 rewards/terminated/mask 进行额外切片
-                # 它们原本就是 [:, :-1]，长度为 T-1，正好与 target_max_qvals 匹配
-                targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
-                                            self.args.n_agents, self.args.gamma, self.args.td_lambda)
-
-        # 3. Calculate Loss
-        # 现在两者应该都是 T-1 长度 (例如 70)
-        td_error = (chosen_action_qvals - targets.detach())
-        loss_td = (td_error ** 2 * mask.expand_as(td_error)).sum() / mask.sum()
-        
         # --- Optimization ---
         total_loss = loss_td + self.args.wm_loss_weight * wm_loss
 
         self.optimiser.zero_grad()
         self.wm_optimiser.zero_grad()
-        
         total_loss.backward()
-        
         th.nn.utils.clip_grad_norm_(self.rl_params, self.args.grad_norm_clip)
         th.nn.utils.clip_grad_norm_(self.wm_params, self.args.grad_norm_clip)
-        
         self.optimiser.step()
         self.wm_optimiser.step()
 
-        # --- Updates & Logging ---
         if (episode_num - self.last_target_update_episode) / self.args.target_update_interval >= 1.0:
             self._update_targets()
             self.last_target_update_episode = episode_num
