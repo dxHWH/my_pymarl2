@@ -1,6 +1,7 @@
 import copy
 from components.episode_buffer import EpisodeBatch
 from modules.mixers.dvd_wm_mixer import DVDWMMixer
+from modules.mixers.dvd_wm_id_mixer import DVDWMIDMixer
 from modules.world_models import REGISTRY as wm_REGISTRY
 from utils.rl_utils import build_td_lambda_targets, build_q_lambda_targets
 import torch as th
@@ -18,6 +19,8 @@ class DVDWMLearner:
         # 1. 初始化 Mixer
         if args.mixer == "dvd_wm":
             self.mixer = DVDWMMixer(args)
+        if args.mixer == "dvd_wm_id":
+            self.mixer = DVDWMIDMixer(args)
         else:
             raise ValueError(f"Mixer {args.mixer} not recognised for DVDWMLearner")
         self.target_mixer = copy.deepcopy(self.mixer)
