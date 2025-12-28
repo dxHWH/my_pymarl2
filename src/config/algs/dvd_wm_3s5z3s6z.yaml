@@ -12,7 +12,7 @@ batch_size: 64
 batch_size_run: 4
 
 # Learner & Mixer
-learner: "dvd_wm_learner"
+learner: "dvd_wm_atten_learner"
 mixer: "dvd_wm_id"
 
 # Standard QMIX params
@@ -22,7 +22,7 @@ hypernet_embed: 64
 hypernet_hidden_dim: 64
 
 # --- World Model Specific Params (New & Isolated) ---
-world_model_type: "vae_rnn"
+world_model_type: "vae_rnn_atten"
 wm_hidden_dim: 128    # 世界模型 RNN 隐层维度 (替代 rnn_hidden_dim)
 wm_latent_dim: 64     # VAE 潜变量维度 Z
 dvd_samples: 8           # 去混淆采样次数

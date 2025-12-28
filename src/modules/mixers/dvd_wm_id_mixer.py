@@ -13,6 +13,7 @@ class HyperAttention(nn.Module):
     
     逻辑: 每个 Agent 根据自己的动态角色，主动从全局上下文中检索与自己归因相关的特征。
     """
+    # [修改 1]: 移除了多余的 n_agents 和 hidden_dim 参数，与 Mixer 调用保持一致
     def __init__(self, input_dim, embed_dim):
         super(HyperAttention, self).__init__()
         self.embed_dim = embed_dim
@@ -23,6 +24,9 @@ class HyperAttention(nn.Module):
         # Key/Value 投影: 处理全局上下文
         self.k_proj = nn.Linear(input_dim, embed_dim)
         self.v_proj = nn.Linear(input_dim, embed_dim)
+
+        # [修改 2]: 移除了未使用的 self.id_embed
+        # 原因：输入的 role_embeddings 已经包含了身份信息 (来自 role_prototypes)
         
         # 2. 输出层
         self.out_proj = nn.Linear(embed_dim, embed_dim)
@@ -30,6 +34,9 @@ class HyperAttention(nn.Module):
         # LayerNorm 保证数值稳定性
         self.ln_q = nn.LayerNorm(embed_dim)
         self.ln_k = nn.LayerNorm(input_dim)
+        
+        # 用于存储权重供 Learner 使用
+        self.last_attn_weights = None
 
     def forward(self, role_embeddings, context):
         """
@@ -54,16 +61,15 @@ class HyperAttention(nn.Module):
         # 2. Scaled Dot-Product Attention
         # Scores: Q * K^T
         # [B, N, E] @ [B, E, 1] -> [B, N, 1]
-        # 物理意义: 计算每个 Agent 的 Role 与当前局势(Context)的"匹配度"或"相关性"
         scale = self.embed_dim ** -0.5
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn_scores = th.matmul(q, k.transpose(-2, -1)) * scale
         
         # 3. Attention Weights
-        # 既然 Key 只有一个 (Global Context)，Softmax 会导致全是 1。
-        # 这里我们需要的是一种"门控"或"强度"机制，而非概率分布。
-        # Tanh 允许负相关性 (即某种局势下，该角色权重被抑制)，Sigmoid 则仅允许正向门控。
-        # 这里使用 Tanh 以获得更丰富的非线性交互。
-        attn_weights = torch.tanh(attn_scores) # [B, N, 1]
+        # 使用 Tanh 作为门控机制 (-1 ~ 1)
+        attn_weights = th.tanh(attn_scores) # [B, N, 1]
+        
+        # [关键]: 保存权重供 Learner 计算 DASA Loss
+        self.last_attn_weights = attn_weights
         
         # 4. Aggregation (Value Retrieval)
         # Context Features 被每个 Agent 根据相关性"截取"
@@ -77,9 +83,9 @@ class HyperAttention(nn.Module):
         return self.out_proj(out)
 
 
-class DVDWMMixer(nn.Module):
+class DVDWMIDMixer(nn.Module):
     def __init__(self, args):
-        super(DVDWMMixer, self).__init__()
+        super(DVDWMIDMixer, self).__init__()
         self.args = args
         self.n_agents = args.n_agents
         self.state_dim = int(np.prod(args.state_shape))
@@ -91,6 +97,7 @@ class DVDWMMixer(nn.Module):
         # [Mechanism 1]: Dynamic Role Generation (动态角色生成)
         # -----------------------------------------------------------
         # 1. 角色原型 (Role Prototypes): Agent 的性格底色 (Static)
+        # 这就是 Agent 的 ID 表征，它是可学习的参数
         self.role_prototypes = nn.Parameter(th.randn(self.n_agents, self.embed_dim))
         
         # 2. 角色调制器 (Role Modulator): 根据战局 Z 调整角色 (Dynamic)
@@ -107,6 +114,7 @@ class DVDWMMixer(nn.Module):
         self.context_dim = self.state_dim + self.latent_dim
         
         # 替代了传统的 agent_weight_net MLP
+        # [修改]: 调用时仅需传递 input_dim 和 embed_dim，与类定义匹配
         self.hyper_attention = HyperAttention(input_dim=self.context_dim, embed_dim=self.embed_dim)
         
         # -----------------------------------------------------------
@@ -118,7 +126,6 @@ class DVDWMMixer(nn.Module):
         self.hyper_b_1 = nn.Linear(self.bias_input_dim, self.embed_dim)
 
         # Hypernet 2 (W2, B2)
-        # W2 主要负责全局加权，保持 MLP 结构即可
         self.hyper_hidden_dim = args.hypernet_hidden_dim
         if self.use_single:
             w2_input_dim = self.state_dim
@@ -168,13 +175,9 @@ class DVDWMMixer(nn.Module):
         
         # Dynamic Role = Prototype * Modulation
         # [1, N, E] * [DBT, 1, E] -> [DBT, N, E] (Broadcasting)
-        # 物理意义: 原型决定了Agent的基础特性，Modulation 决定了在当前 Z 下这些特性被激活/抑制的程度
         dynamic_roles = self.role_prototypes.unsqueeze(0) * modulation.unsqueeze(1)
         
         # [Critical]: 保存供 Learner 计算 "Attribution Consistency Loss"
-        # 恢复维度 [D, B, T, N, E] -> 取 mean 或者直接保存 reshape 后的引用
-        # 这里为了 Learner 方便，我们保存 View 之后的 Tensor
-        # Learner 那边通常只需要 [B, T, N, E] (均值)
         self.last_dynamic_roles = dynamic_roles.view(D, bs, ts, self.n_agents, -1).mean(dim=0)
 
         # ---------------------------------------------------
@@ -184,7 +187,6 @@ class DVDWMMixer(nn.Module):
         global_context = th.cat([states_reshaped, z_reshaped], dim=-1) # [DBT, S+L]
         
         # Attention Forward
-        # Query=Dynamic Roles, Key/Val=Global Context
         w1_features = self.hyper_attention(dynamic_roles, global_context) # [DBT, N, Embed]
         
         # QMIX 约束: 权重必须为非负
@@ -201,7 +203,6 @@ class DVDWMMixer(nn.Module):
         b1 = self.hyper_b_1(bias_input).view(-1, 1, self.embed_dim)
         
         # Layer 1: Q_hidden = ELU( Q * W1 + B1 )
-        # [DBT, 1, N] * [DBT, N, E] -> [DBT, 1, E]
         hidden = F.elu(th.bmm(qs_reshaped, w1) + b1)
         
         # W2 Generation

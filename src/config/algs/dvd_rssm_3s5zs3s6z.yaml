@@ -1,0 +1,54 @@
+# --- DVD with RSSM World Model Config ---
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "episode"
+buffer_size: 2500
+target_update_interval: 200
+
+# Learner & Mixer
+learner: "dvd_rssm_learner"
+mixer: "dvd_wm"
+
+# Standard QMIX params
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+hypernet_hidden_dim: 64
+
+# --- World Model Specific Params (RSSM) ---
+world_model_type: "rssm"  # 对应 registry 中的 key
+
+# RSSM 内部维度
+rssm_hidden_dim: 128      # 确定性状态 h 的维度 (GRU)
+rssm_latent_dim: 64       # 随机状态 z 的维度 (VAE Latent)
+
+# 核心 trick: 告诉 Mixer 输入的 latent 维度是 h + z 的总和
+# Mixer 不需要知道它是 h 还是 z，只把它当做一个大的特征向量
+wm_latent_dim: 192        # = 128 (hidden) + 64 (latent)
+
+dvd_samples: 1            # RSSM 通常单次采样即可，因为有 h 支撑
+wm_kl_beta: 0.5           # KL Loss 权重，RSSM 中通常可以大一点来做 KL Balancing
+wm_loss_weight: 1.0       # 总 Loss 权重
+
+# --- Optimization Params ---
+lr: 0.001
+wm_lr: 0.0001
+optimizer: 'adam'
+
+name: "dvd_rssm_qmix"
+
+# Agent params
+mac: "n_mac"
+agent: "n_rnn"
+agent_output_type: q
+td_lambda: 0.6
+
+# Trick configs
+use_z_bias: True    
+use_z_warmup: False      
+z_warmup_steps: 150000 
+use_single: False

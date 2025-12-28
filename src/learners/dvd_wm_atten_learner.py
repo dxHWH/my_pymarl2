@@ -1,6 +1,7 @@
 import copy
 from components.episode_buffer import EpisodeBatch
 from modules.mixers.dvd_wm_mixer import DVDWMMixer
+from modules.mixers.dvd_wm_id_mixer import DVDWMIDMixer
 from modules.world_models import REGISTRY as wm_REGISTRY
 from utils.rl_utils import build_td_lambda_targets
 import torch as th
@@ -16,8 +17,8 @@ class DVDWMAttenLearner:
         self.device = th.device('cuda' if args.use_cuda else 'cpu')
 
         # 1. 初始化 Mixer (支持 HyperAttention)
-        if args.mixer == "dvd_wm":
-            self.mixer = DVDWMMixer(args)
+        if args.mixer == "dvd_wm_id":
+            self.mixer = DVDWMIDMixer(args)
         else:
             raise ValueError(f"Mixer {args.mixer} not recognised for DVDWMAttenLearner")
         self.target_mixer = copy.deepcopy(self.mixer)
@@ -183,7 +184,7 @@ class DVDWMAttenLearner:
         # PyTorch F.kl_div(input, target) 中: input 是 log_prob (Student), target 是 prob (Teacher)
         
         # Student Log-Prob
-        mixer_log_prob = torch.log(mixer_dist + 1e-10).view(-1, self.args.n_agents) # [B*(T-1), N]
+        mixer_log_prob = th.log(mixer_dist + 1e-10).view(-1, self.args.n_agents) # [B*(T-1), N]
         # Teacher Prob
         wm_prob = wm_attn_seq.reshape(-1, self.args.n_agents) # [B*(T-1), N]
         
@@ -240,6 +241,78 @@ class DVDWMAttenLearner:
             self.logger.log_stat("loss_wm", wm_loss.item(), t_env)
             self.logger.log_stat("loss_align", align_loss.item(), t_env)
             self.log_stats_t = t_env
+
+    def evaluate_world_model(self, batch, t_env):
+        if batch.device != self.args.device:
+            batch.to(self.args.device)
+        bs = batch.batch_size
+        max_t = batch.max_seq_length
+        
+        # 1. 准备数据
+        # 显式分离 state 和 action，以适配新的 EntityAttention 接口
+        state_seq = batch["state"]
+        actions_onehot_seq = batch["actions_onehot"] # [B, T, N, A]
+        
+        target_states = batch["state"][:, 1:] 
+        mask = batch["filled"][:, :-1].float().squeeze(-1)
+
+        self.world_model.eval()
+        pred_states_list = []
+        
+        with th.no_grad():
+            wm_hidden = self.world_model.init_hidden(bs, self.device)
+            # 循环预测 Next State
+            for t in range(max_t - 1):
+                # 调用 forward_step 获取 hidden 和 dist
+                # 注意：这里 Evaluation 时我们通常使用均值(Mean)作为潜变量 z，以获得确定性预测
+                wm_hidden, dist_params, _ = self.world_model.forward_step(
+                    state_seq[:, t], wm_hidden, actions_onehot_seq[:, t]
+                )
+                
+                # 使用均值 (mu) 作为 z
+                mu = dist_params[0]
+                z = mu # Deterministic z
+                
+                # 手动调用 Decoder 预测 Next State (这一步逻辑通常在 predict 或 compute_loss 里，这里手动还原以便计算 MSE)
+                # 构造 decoder input [B, L+H]
+                decoder_input = th.cat([z, wm_hidden], dim=-1)
+                pred_out = self.world_model.fc_decoder(decoder_input) # [B, S+1]
+                pred_next_state = pred_out[:, :-1]
+                
+                pred_states_list.append(pred_next_state)
+            
+            # 堆叠预测结果 [B, T-1, S]
+            pred_states = th.stack(pred_states_list, dim=1)
+            
+            # 2. 计算 MSE
+            errors = (pred_states - target_states) ** 2
+            mse_per_step = errors.mean(dim=-1) 
+            masked_mse = (mse_per_step * mask).sum() / mask.sum()
+            
+            # 3. 计算 R^2 (决定系数)
+            mask_bool = mask.bool()
+            # 展平只取 valid 的数据点
+            y_true_flat = target_states[mask_bool.unsqueeze(-1).expand_as(target_states)].reshape(-1, self.state_dim)
+            y_pred_flat = pred_states[mask_bool.unsqueeze(-1).expand_as(pred_states)].reshape(-1, self.state_dim)
+            
+            ss_res = ((y_true_flat - y_pred_flat) ** 2).sum()
+            y_mean = y_true_flat.mean(dim=0)
+            ss_tot = ((y_true_flat - y_mean) ** 2).sum()
+            
+            # 防止除以零
+            r2_score = 1 - (ss_res / (ss_tot + 1e-8)) if ss_tot.item() != 0 else 0.0
+
+            # 4. Logging
+            log_prefix = "test_wm_"
+            self.logger.log_stat(log_prefix + "mse", masked_mse.item(), t_env)
+            self.logger.log_stat(log_prefix + "r2", r2_score.item(), t_env)
+            
+            print(f"\n[Test Evaluation] World Model Performance at t_env={t_env}:")
+            print(f"  >>> MSE: {masked_mse.item():.6f}")
+            print(f"  >>> R^2: {r2_score.item():.6f}")
+            print("-" * 50)
+            
+        self.world_model.train()
 
     def _update_targets(self):
         self.target_mac.load_state(self.mac)
