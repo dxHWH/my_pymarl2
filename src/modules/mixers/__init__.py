@@ -7,6 +7,7 @@ from .dvd import DVDMixer
 
 from .dvd_wm_mixer import DVDWMMixer      # <--- 新增
 from .dvd_wm_id_mixer import DVDWMIDMixer
+from .dvd_wm_causal_mixer import DVDWMCausalMixer
 
 
 
@@ -18,5 +19,6 @@ REGISTRY = {
     "attention_qmix": AttentionQMixer,
     "dvd": DVDMixer,
     "dvd_wm":DVDWMMixer,
-    "dvd_wm_id":DVDWMIDMixer
+    "dvd_wm_id":DVDWMIDMixer,
+    "dvd_wm_causal": DVDWMCausalMixer
 }

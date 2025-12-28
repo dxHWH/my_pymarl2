@@ -17,6 +17,7 @@ from .dvd_wm_learner import DVDWMLearner  # <--- 新增
 from .dvd_rssm_learner import DVDRssmLearner
 from .dvd_rssm_learner_origin import DVDRssmLearnerOrigin
 from .dvd_wm_atten_learner import DVDWMAttenLearner
+from .dvd_wm_causal_learner import DVDWMCausalLearner
 
 
 
@@ -44,4 +45,5 @@ REGISTRY["dvd_wm_learner"] = DVDWMLearner # <--- 新增
 REGISTRY["dvd_rssm_learner"] = DVDRssmLearner
 REGISTRY["dvd_rssm_learner_origin"] = DVDRssmLearnerOrigin
 REGISTRY["dvd_wm_atten_learner"] = DVDWMAttenLearner
+REGISTRY["dvd_wm_causal_learner"] = DVDWMCausalLearner
 

@@ -1,0 +1,39 @@
+# --- DVD-WM Causal Config ---
+name: "dvd_wm_causal"
+
+# 1. 核心组件
+learner: "dvd_wm_causal_learner"
+mixer: "dvd_wm_causal"
+
+# 2. World Model (标准 RNN-VAE)
+world_model_type: "vae_rnn"
+rnn_hidden_dim: 64
+wm_latent_dim: 32
+wm_lr: 0.0005
+wm_kl_beta: 0.1
+wm_loss_weight: 0.1
+
+# 3. 因果对齐配置
+causal_beta: 0.01        # 强迫 Mixer 学习因果权重的 Loss 系数
+align_start_steps: 500000 # Warmup: WM 训练稳定后再开启对齐
+
+# 4. 采样与其他
+dvd_samples: 8
+use_z_bias: True
+use_z_warmup: True
+z_warmup_steps: 100000
+
+# Standard Configs
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+runner: "parallel"
+batch_size: 128
+buffer_size: 5000
+t_max: 1050000
+
+target_update_interval: 200
+# grad_norm_clip: 10
+obs_agent_id: True
+obs_last_action: True
