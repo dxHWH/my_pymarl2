@@ -43,7 +43,7 @@ class DVDWMCausalLearner:
         self.causal_beta = getattr(args, "causal_beta", 0.01)
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, per_weight=None):
-        # 获取 Batch 配置
+        # 1. 基础配置与数据准备
         bs = batch.batch_size
         max_seq_length = batch.max_seq_length
         rewards = batch["reward"][:, :-1]
@@ -52,10 +52,15 @@ class DVDWMCausalLearner:
         mask = batch["filled"][:, :-1].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
+        
+        # 优化器配置 (建议使用 Adam)
+        # reward_sensitivity: 建议 20.0 ~ 50.0，平衡 KL 和 Reward 量级
+        reward_sensitivity = getattr(self.args, "reward_sensitivity", 20.0)
 
         # =================================================================
-        # 1. RL Agent Forward (Full Batch)
+        # 2. RL Agent (MAC) Forward
         # =================================================================
+        # 标准 QMIX 流程，无需改动
         self.mac.agent.train()
         mac_out = []
         self.mac.init_hidden(bs)
@@ -63,11 +68,8 @@ class DVDWMCausalLearner:
             agent_outs = self.mac.forward(batch, t=t)
             mac_out.append(agent_outs)
         mac_out = th.stack(mac_out, dim=1)
-        
-        # 提取当前动作对应的 Q 值
         chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
 
-        # Target MAC Forward
         with th.no_grad():
             self.target_mac.agent.train()
             target_mac_out = []
@@ -76,145 +78,84 @@ class DVDWMCausalLearner:
                 target_agent_outs = self.target_mac.forward(batch, t=t)
                 target_mac_out.append(target_agent_outs)
             target_mac_out = th.stack(target_mac_out, dim=1)
-            
             mac_out_detach = mac_out.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
 
         # =================================================================
-        # 2. World Model & Causal Inference
+        # 3. World Model Training (Dual-Path: Full & Masked) [核心重构]
         # =================================================================
-        joint_actions = batch["actions_onehot"].reshape(bs, max_seq_length, -1)
-        wm_inputs = th.cat([batch["state"], joint_actions], dim=-1)
+        # 目的：让 WM 既能理解完整世界，也能理解缺失 Agent 的世界(Zero Mask)
         
-        wm_hidden = self.world_model.init_hidden(bs, self.device)
+        joint_actions = batch["actions_onehot"].reshape(bs, max_seq_length, -1)
+        
+        # [Path A]: Full Context Input
+        wm_inputs_full = th.cat([batch["state"], joint_actions], dim=-1)
+        
+        # [Path B]: Masked Context Input (模拟 ICES 的 Local Model 训练)
+        # 策略：每个样本在每一时刻，随机 Mask 掉一个 Agent 的动作 (置为0)
+        with th.no_grad():
+            # 生成随机索引 [B, T, 1]
+            rand_agent_idx = th.randint(0, self.args.n_agents, (bs, max_seq_length, 1), device=self.device)
+            # 生成 Mask 矩阵 [B, T, N] (1=Keep, 0=Drop)
+            dropout_mask = 1.0 - F.one_hot(rand_agent_idx.squeeze(-1), num_classes=self.args.n_agents).float()
+            # 扩展到动作维度 [B, T, N, A]
+            dropout_mask_exp = dropout_mask.unsqueeze(-1).expand(bs, max_seq_length, self.args.n_agents, self.args.n_actions)
+            # 应用 Mask (Zero Masking)
+            joint_actions_masked = batch["actions_onehot"] * dropout_mask_exp
+            joint_actions_masked_flat = joint_actions_masked.reshape(bs, max_seq_length, -1)
+            
+        wm_inputs_masked = th.cat([batch["state"], joint_actions_masked_flat], dim=-1)
+
+        # 初始化 Hidden States
+        wm_hidden_full = self.world_model.init_hidden(bs, self.device)
+        wm_hidden_masked = self.world_model.init_hidden(bs, self.device) # Masked 路径需要独立的 hidden 演化
         
         recon_losses, kl_losses, reward_losses = [], [], []
-        z_history = []
-        causal_weights_history = [] 
-
-        # 因果推断参数
-        reward_sensitivity = 10.0  # 奖励差异的权重系数
         
+        # 存储用于 RL 的 Latent (只使用 Full Path 的 z，因为它最准确)
+        z_history_rl = []
+        # 存储用于因果推理的 Hidden (Full Path)
+        hidden_history_causal = []
+
         for t in range(max_seq_length):
-            # [关键]: 在 Update 前缓存当前时刻 hidden (h_t)
-            # 反事实推理的基础是: 给定当前的 h_t, 如果动作变了, h_{t+1} 会怎么变?
-            current_hidden = wm_hidden.detach().clone()
-            
-            # --- A. Factual Pass (事实路径) ---
-            input_t = wm_inputs[:, t]
-            # wm_hidden 更新为 h_{t+1}
-            wm_hidden, dist_params = self.world_model.forward_step(input_t, wm_hidden)
-            
-            # --- B. Causal Perturbation Pass (反事实路径) ---
-            if t < max_seq_length - 1:
-                with th.no_grad():
-                    n_agents = self.args.n_agents
-                    
-                    # 1. 数据准备与扩展
-                    # State [B, S] -> [B*N, S]
-                    state_t = batch["state"][:, t]
-                    state_repeat = state_t.repeat_interleave(n_agents, dim=0)
-                    
-                    # Hidden [B, H] -> [B*N, H] (使用缓存的 h_t)
-                    hidden_repeat = current_hidden.repeat_interleave(n_agents, dim=0)
-                    
-                    # Action [B, N, A]
-                    action_t = batch["actions_onehot"][:, t]
+            # 缓存当前 Full Hidden 用于后面的 Causal Inference
+            current_hidden_full = wm_hidden_full.detach().clone()
+            hidden_history_causal.append(current_hidden_full)
 
-                    # 2. 构造反事实动作 (Counterfactual Actions)
-                    # 目标: 将对角线上的 Agent 动作替换为 Action 1 (Stop)
-                    
-                    # (a) 扩展原始动作 [B, 1, N, A] -> [B, N, N, A]
-                    action_exp = action_t.unsqueeze(1).expand(-1, n_agents, -1, -1).clone()
-                    
-                    # (b) 构造掩码
-                    # mask_mat (保留项): 对角线为 0, 其他为 1
-                    mask_mat = 1.0 - th.eye(n_agents, device=self.device).view(1, n_agents, n_agents, 1)
-                    # inv_mask_mat (替换项): 对角线为 1, 其他为 0
-                    inv_mask_mat = 1.0 - mask_mat
-                    
-                    # (c) 构造 Stop 动作向量 [1, 1, 1, A]
-                    # Action 1 是 Stop, 对应的 One-hot 是 [0, 1, 0, 0, ...]
-                    # 注意: 确保 n_actions >= 2
-                    stop_action = th.zeros(1, 1, 1, self.args.n_actions, device=self.device)
-                    if self.args.n_actions > 1:
-                        stop_action[..., 1] = 1.0 
-                    
-                    # (d) 融合: 原始动作 * Mask + Stop动作 * InvMask
-                    # 结果: 第 i 个平行宇宙中, Agent i 执行 Stop, 其他人保持原样
-                    action_cf_4d = (action_exp * mask_mat) + (stop_action * inv_mask_mat)
-                    
-                    # Flatten -> [B * N, N * A]
-                    action_cf_flat = action_cf_4d.view(bs * n_agents, -1)
-                    
-                    # 3. 构造 WM 输入
-                    pert_input = th.cat([state_repeat, action_cf_flat], dim=-1)
-                    
-                    # 4. Counterfactual Forward (P(z | h_t, a_perturbed))
-                    # 得到反事实的 h'_{t+1} 和分布参数
-                    cf_hidden_next, cf_dist_params = self.world_model.forward_step(pert_input, hidden_repeat)
-                    
-                    # 5. 计算混合因果效应 (Hybrid Causal Effect)
-                    
-                    # --- Part 1: Physical Effect (KL Divergence) ---
-                    # 准备 Factual 参数 (扩展以匹配维度)
-                    mu_fac = dist_params[0].detach().unsqueeze(1).expand(-1, n_agents, -1)
-                    logvar_fac = dist_params[1].detach().unsqueeze(1).expand(-1, n_agents, -1)
-                    var_fac = th.exp(logvar_fac)
-                    
-                    # 准备 Counterfactual 参数 (Reshape)
-                    mu_cf = cf_dist_params[0].view(bs, n_agents, -1)
-                    logvar_cf = cf_dist_params[1].view(bs, n_agents, -1)
-                    var_cf = th.exp(logvar_cf)
-                    
-                    # KL(P || Q)
-                    term1 = var_fac / (var_cf + 1e-8)
-                    term2 = (mu_fac - mu_cf).pow(2) / (var_cf + 1e-8)
-                    term3 = logvar_cf - logvar_fac
-                    kl_div = 0.5 * th.sum(term1 + term2 + term3 - 1, dim=-1) # [B, N]
-                    
-                    # --- Part 2: Value Effect (Reward Difference) ---
-                    # 利用 Reward Head 预测奖励
-                    
-                    # Factual Reward: Head(z_fac, h_{t+1})
-                    # 使用均值 z 预测 (deterministic)
-                    z_fac = dist_params[0].detach() 
-                    # 注意: 这里使用更新后的 wm_hidden (h_{t+1})
-                    fac_input_reward = th.cat([z_fac, wm_hidden.detach()], dim=-1)
-                    r_fac = self.world_model.reward_head(fac_input_reward) # [B, 1]
-                    r_fac_exp = r_fac.unsqueeze(1).expand(-1, n_agents, -1) # [B, N, 1]
-                    
-                    # Counterfactual Reward: Head(z_cf, h'_{t+1})
-                    z_cf = cf_dist_params[0] 
-                    # 注意: 这里使用反事实的 next hidden
-                    cf_input_reward = th.cat([z_cf, cf_hidden_next], dim=-1) 
-                    r_cf = self.world_model.reward_head(cf_input_reward) # [B*N, 1]
-                    r_cf_view = r_cf.view(bs, n_agents, -1) # [B, N, 1]
-                    
-                    # Reward Difference (MSE)
-                    # "如果我变成Stop, 预测奖励会变多少?"
-                    r_diff = (r_fac_exp - r_cf_view).pow(2).sum(dim=-1) # [B, N]
-                    
-                    # --- Combine Effects ---
-                    total_effect = kl_div + reward_sensitivity * r_diff
-                    
-                    causal_weights = F.softmax(total_effect, dim=-1)
-                    causal_weights_history.append(causal_weights)
+            # --- Forward Path A (Full) ---
+            input_full = wm_inputs_full[:, t]
+            wm_hidden_full, dist_params_full = self.world_model.forward_step(input_full, wm_hidden_full)
+            z_samples_full = self.world_model.sample_latents(dist_params_full, num_samples=self.args.dvd_samples)
+            z_history_rl.append(z_samples_full)
 
-            # --- C. WM Loss Calculation (Standard) ---
-            z_samples = self.world_model.sample_latents(dist_params, num_samples=self.args.dvd_samples)
-            z_history.append(z_samples)
-            
+            # --- Forward Path B (Masked) ---
+            # 这一步是为了训练 WM 适应 Zero Mask
+            input_masked = wm_inputs_masked[:, t]
+            wm_hidden_masked, dist_params_masked = self.world_model.forward_step(input_masked, wm_hidden_masked)
+            z_samples_masked = self.world_model.sample_latents(dist_params_masked, num_samples=1) # 训练不需要多采样
+
+            # --- Compute Losses ---
             if t < max_seq_length - 1:
                 target_state = batch["state"][:, t+1]
                 target_reward = batch["reward"][:, t]
-                # 计算重建损失和奖励预测损失
-                r_l, k_l, rew_l = self.world_model.compute_loss(
-                    z_samples, wm_hidden, target_state, dist_params, target_reward
+                
+                # Loss A: Full Context 重建能力
+                r_l_f, k_l_f, rew_l_f = self.world_model.compute_loss(
+                    z_samples_full, wm_hidden_full, target_state, dist_params_full, target_reward
                 )
-                recon_losses.append(r_l); kl_losses.append(k_l); reward_losses.append(rew_l)
+                
+                # Loss B: Masked Context 重建能力 (关键！)
+                # 强迫模型利用剩下的 N-1 个 Agent 还原真实结果
+                r_l_m, k_l_m, rew_l_m = self.world_model.compute_loss(
+                    z_samples_masked, wm_hidden_masked, target_state, dist_params_masked, target_reward
+                )
+                
+                # 合并 Loss (取平均或加和)
+                recon_losses.append(r_l_f + r_l_m)
+                kl_losses.append(k_l_f + k_l_m)
+                reward_losses.append(rew_l_f + rew_l_m)
 
         # 聚合 WM Loss
         mask_squeeze = mask.squeeze(-1)
@@ -230,11 +171,93 @@ class DVDWMCausalLearner:
                   (reward_stack * mask_wm).sum() / mask_wm.sum()
 
         # =================================================================
-        # 3. Mixer Forward & Alignment
+        # 4. Causal Inference (基于 Zero Mask)
         # =================================================================
-        z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3).detach() # [D, B, T, L]
+        # 现在 WM 已经见过 Zero Mask 了，我们可以放心地使用全零向量进行反事实推理
         
-        # Z Warmup
+        causal_weights_history = [] 
+        
+        # 只需要计算到 min_len
+        for t in range(min_len):
+            with th.no_grad():
+                n_agents = self.args.n_agents
+                
+                # 1. 准备数据
+                # Factual Hidden (h_t)
+                hidden_t = hidden_history_causal[t] # [B, H]
+                
+                # State & Action (t)
+                state_t = batch["state"][:, t]
+                action_t = batch["actions_onehot"][:, t] # [B, N, A]
+                
+                # 扩展数据 [B*N, ...]
+                state_repeat = state_t.repeat_interleave(n_agents, dim=0)
+                hidden_repeat = hidden_t.repeat_interleave(n_agents, dim=0)
+                
+                # 2. 构造反事实动作: Zero Masking (Theory Correct & Now In-Distribution)
+                # ------------------------------------------------------
+                action_exp = action_t.unsqueeze(1).expand(-1, n_agents, -1, -1).clone() # [B, N, N, A]
+                
+                # 构造对角线 Mask (保留非对角线，对角线置 0)
+                mask_mat = 1.0 - th.eye(n_agents, device=self.device).view(1, n_agents, n_agents, 1)
+                
+                # 直接乘！对角线变为 [0,0,0...]
+                action_cf_4d = action_exp * mask_mat 
+                action_cf_flat = action_cf_4d.view(bs * n_agents, -1)
+                
+                # 3. WM Forward
+                # Factual Pass (为了获取基准 Reward 和 KL 参数)
+                wm_in_fac = wm_inputs_full[:, t]
+                hidden_next_fac, dist_fac = self.world_model.forward_step(wm_in_fac, hidden_t)
+                
+                # Counterfactual Pass (Zero Mask)
+                pert_input = th.cat([state_repeat, action_cf_flat], dim=-1)
+                hidden_next_cf, dist_cf = self.world_model.forward_step(pert_input, hidden_repeat)
+                
+                # 4. 计算混合效应 (Hybrid Effect)
+                # ------------------------------------------------------
+                
+                # (A) 物理效应 (KL)
+                mu_fac = dist_fac[0].detach().unsqueeze(1).expand(-1, n_agents, -1)
+                logvar_fac = dist_fac[1].detach().unsqueeze(1).expand(-1, n_agents, -1)
+                var_fac = th.exp(logvar_fac)
+                
+                mu_cf = dist_cf[0].view(bs, n_agents, -1)
+                logvar_cf = dist_cf[1].view(bs, n_agents, -1)
+                var_cf = th.exp(logvar_cf)
+                
+                term1 = var_fac / (var_cf + 1e-8)
+                term2 = (mu_fac - mu_cf).pow(2) / (var_cf + 1e-8)
+                term3 = logvar_cf - logvar_fac
+                kl_div = 0.5 * th.sum(term1 + term2 + term3 - 1, dim=-1)
+                
+                # (B) 价值效应 (Reward Diff)
+                # Factual Reward: Head(z_fac, h_{t+1})
+                z_fac = dist_fac[0].detach() 
+                r_in_fac = th.cat([z_fac, hidden_next_fac.detach()], dim=-1)
+                r_fac = self.world_model.reward_head(r_in_fac) # [B, 1]
+                r_fac_exp = r_fac.unsqueeze(1).expand(-1, n_agents, -1)
+                
+                # Counterfactual Reward: Head(z_cf, h'_{t+1})
+                # 由于 WM 见过 Zero Mask，它会预测出:"如果这个Agent不在，可能没伤害，没Reward"
+                z_cf = dist_cf[0]
+                r_in_cf = th.cat([z_cf, hidden_next_cf], dim=-1)
+                r_cf = self.world_model.reward_head(r_in_cf) # [B*N, 1]
+                r_cf_view = r_cf.view(bs, n_agents, -1)
+                
+                # Diff (L2 or L1)
+                r_diff = (r_fac_exp - r_cf_view).pow(2).sum(dim=-1)
+                
+                # Combine
+                total_effect = kl_div + reward_sensitivity * r_diff
+                causal_weights_history.append(F.softmax(total_effect, dim=-1))
+
+        # =================================================================
+        # 5. Mixer Forward & Alignment
+        # =================================================================
+        z_tensor = th.stack(z_history_rl, dim=0).permute(1, 2, 0, 3).detach() # [D, B, T, L]
+        
+        # Warmup
         warmup_coef = 1.0 
         if getattr(self.args, "use_z_warmup", False) and t_env < self.args.z_warmup_steps:
              warmup_coef = float(t_env) / float(self.args.z_warmup_steps)
@@ -246,28 +269,25 @@ class DVDWMCausalLearner:
 
         # Alignment Loss
         if len(causal_weights_history) > 0:
-            target_probs = th.stack(causal_weights_history, dim=1) # [B, T-1, N]
+            target_probs = th.stack(causal_weights_history, dim=1) # [B, T, N]
             target_probs = th.clamp(target_probs, min=1e-6, max=1.0-1e-6)
             
-            # 获取 Mixer 的 Attention 权重
-            mixer_raw = self.mixer.hyper_attention.last_attn_weights # [D*B*T, N, 1] or similar
+            mixer_raw = self.mixer.hyper_attention.last_attn_weights
             d_samples = self.args.dvd_samples
-            # Reshape & Mean: [D, B, T, N] -> [B, T, N]
+            # [D, B, T, N] -> [B, T, N]
             mixer_attn = mixer_raw.view(d_samples, bs, -1, self.args.n_agents).mean(dim=0)
             
-            # 截断以匹配长度
+            # Truncate to min_len
             valid_T = target_probs.shape[1]
             mixer_attn = mixer_attn[:, :valid_T, :]
             
             mixer_log_prob = F.log_softmax(th.abs(mixer_attn), dim=-1)
-            
             align_loss_raw = F.kl_div(mixer_log_prob, target_probs, reduction='none').sum(dim=-1)
             align_loss = (align_loss_raw * mask_wm).sum() / mask_wm.sum()
         else:
             align_loss = th.tensor(0.0).to(self.device)
-        
-        # Alignment Beta Annealing (线性衰减)
-        # 目的: 初期强引导, 后期让 RL 自适应
+            
+        # Annealing Beta
         if t_env < getattr(self.args, "align_start_steps", 0):
             curr_beta = 0.0
         else:
@@ -277,7 +297,7 @@ class DVDWMCausalLearner:
             curr_beta = self.causal_beta * decay_factor
 
         # =================================================================
-        # 4. Optimization
+        # 6. Optimization
         # =================================================================
         with th.no_grad():
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"], z_tensor_mixer)
