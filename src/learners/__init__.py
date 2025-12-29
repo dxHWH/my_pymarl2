@@ -18,6 +18,7 @@ from .dvd_rssm_learner import DVDRssmLearner
 from .dvd_rssm_learner_origin import DVDRssmLearnerOrigin
 from .dvd_wm_atten_learner import DVDWMAttenLearner
 from .dvd_wm_causal_learner import DVDWMCausalLearner
+from .wm_learner import WMLearner
 
 
 

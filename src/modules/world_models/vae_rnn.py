@@ -2,140 +2,162 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class VAERNNWorldModel(nn.Module):
+class VaeRNN(nn.Module):
     def __init__(self, input_dim, args):
-        super(VAERNNWorldModel, self).__init__()
+        super(VaeRNN, self).__init__()
         self.args = args
         
         # 1. 维度解析
-        # input_dim 是 Learner 传入的 (State_Dim + N_Agents * N_Actions)
         self.input_dim = input_dim 
         
-        # 解析 State Dimension (Decoder 的预测目标维度)
+        # 解析 State Dimension
         if isinstance(args.state_shape, int):
             self.state_dim = args.state_shape
         else:
             self.state_dim = int(args.state_shape[0])
 
-        self.rnn_hidden_dim = args.wm_hidden_dim
-        self.latent_dim = args.wm_latent_dim
+        # 支持参数名兼容 (wm_hidden_dim 或 rnn_hidden_dim)
+        self.rnn_hidden_dim = getattr(args, "wm_hidden_dim", getattr(args, "rnn_hidden_dim", 64))
+        self.latent_dim = getattr(args, "wm_latent_dim", getattr(args, "latent_dim", 32))
 
         # 2. Encoder (Feature Extractor)
-        # 输入: Current State + Joint Actions
-        self.fc1 = nn.Linear(self.input_dim, self.rnn_hidden_dim)
+        self.fc_input = nn.Linear(self.input_dim, self.rnn_hidden_dim)
         
         # 3. RNN (Deterministic Path)
         self.rnn = nn.GRUCell(self.rnn_hidden_dim, self.rnn_hidden_dim)
 
         # 4. Posterior Encoder (Inference Path)
-        # 从 RNN 隐状态推断 Z 的分布
         self.fc_mu = nn.Linear(self.rnn_hidden_dim, self.latent_dim)
         self.fc_logvar = nn.Linear(self.rnn_hidden_dim, self.latent_dim)
 
         # 5. Decoder (Predictor)
-        # 输入: z_t (随机) + h_t (记忆)
-        # 输出: Next State (预测值) -> 维度应该是 state_dim !!!
-        self.decoder = nn.Sequential(
-            nn.Linear(self.latent_dim + self.rnn_hidden_dim, self.rnn_hidden_dim),
+        # 输入: z_t + h_t
+        self.decoder_input_dim = self.latent_dim + self.rnn_hidden_dim
+        self.state_decoder = nn.Sequential(
+            nn.Linear(self.decoder_input_dim, 128),
             nn.ReLU(),
-            nn.Linear(self.rnn_hidden_dim, self.state_dim) # <--- 修正: 输出维度为 state_dim
+            nn.Linear(128, self.state_dim)
         )
 
-        # [新增] Reward Predictor
-        # 输入: z_t + h_t
-        # 输出: Predicted Reward
-        self.reward_head = nn.Sequential(
-            nn.Linear(self.latent_dim + self.rnn_hidden_dim, self.rnn_hidden_dim),
+        # 6. Reward Predictor (Independent Head)
+        self.reward_predictor = nn.Sequential(
+            nn.Linear(self.decoder_input_dim, 64),
             nn.ReLU(),
-            nn.Linear(self.rnn_hidden_dim, 1)
+            nn.Linear(64, 1)
         )
 
     def init_hidden(self, batch_size, device):
         return torch.zeros(batch_size, self.rnn_hidden_dim).to(device)
 
     def forward_step(self, obs_input, hidden_state):
-        x = F.relu(self.fc1(obs_input))
+        """
+        单步前向传播
+        """
+        # 1. Embedding
+        x = F.relu(self.fc_input(obs_input))
+        
+        # 2. RNN Update: h_{t-1} -> h_t
+        # 确保 hidden_state 维度正确 [B, H]
         h_in = hidden_state.reshape(-1, self.rnn_hidden_dim)
         next_hidden = self.rnn(x, h_in)
         
+        # 3. Predict Latent Distribution P(z_t | h_t)
         mu = self.fc_mu(next_hidden)
         logvar = self.fc_logvar(next_hidden)
         
         return next_hidden, (mu, logvar)
 
     def sample_latents(self, dist_params, num_samples=1):
+        """
+        重参数化采样 z
+        返回: [Samples, Batch, Latent]
+        """
         mu, logvar = dist_params
         std = torch.exp(0.5 * logvar)
-        eps = torch.randn(num_samples, *std.shape).to(std.device)
-        z = mu.unsqueeze(0) + eps * std.unsqueeze(0) 
+        
+        # [Samples, Batch, Latent]
+        eps = torch.randn(num_samples, *mu.shape, device=mu.device)
+        z = mu.unsqueeze(0) + eps * std.unsqueeze(0)
+        
+        # 为了兼容旧代码 (如果调用方不处理 Samples 维度，我们自动 squeeze)
+        # 但如果是因果推理 (需要多采样)，调用方应显式处理
+        if num_samples == 1:
+            z = z.squeeze(0)
+            
         return z
+
+    def reward_head(self, feature_input):
+        """
+        暴露给外部的 Reward 预测接口
+        feature_input: cat([z, h], dim=-1)
+        """
+        return self.reward_predictor(feature_input)
+
+    def decode(self, z, hidden_state):
+        """
+        手动解码预测 Next State (兼容旧接口)
+        """
+        inp = torch.cat([z, hidden_state], dim=-1)
+        pred_next_state = self.state_decoder(inp)
+        return pred_next_state
 
     def compute_loss(self, z_samples, hidden_state, target_state, dist_params, target_reward=None):
         """
-        z_samples: [D, B, Latent]
-        hidden_state: [B, Hidden]
-        target_state: [B, State_Dim] (真实发生的 Next State)
-        dist_params: (mu, logvar)
-        target_reward: [B, 1] (可选，真实奖励)
+        计算 WM 的所有 Loss
+        增强: 支持 z_samples 为 [Samples, Batch, Latent] 的多采样计算
         """
         mu, logvar = dist_params
         
-        # 重构 Loss (Reconstruction)
-        # 简单起见，使用第一次采样的 z (或者均值 z) 来进行预测
-        z_0 = z_samples[0] # [B, Latent]
+        # 维度适配
+        # 如果 z 是 [B, L] (单次采样)，扩展为 [1, B, L]
+        if z_samples.dim() == 2:
+            z_samples = z_samples.unsqueeze(0)
         
-        # 拼接 Input: [z, h]
-        inp = torch.cat([z_0, hidden_state], dim=-1) # [B, Latent + Hidden]
+        num_samples = z_samples.shape[0]
         
-        # 预测下一时刻的 State
-        pred_next_state = self.decoder(inp) # [B, State_Dim]
+        # 扩展 hidden 和 targets 以匹配采样数 (Broadcasting)
+        # hidden: [B, H] -> [1, B, H] -> [S, B, H]
+        h_exp = hidden_state.unsqueeze(0).expand(num_samples, -1, -1)
+        # target_state: [B, S] -> [S, B, S]
+        s_target_exp = target_state.unsqueeze(0).expand(num_samples, -1, -1)
         
-        # 计算 MSE Loss
-        # 确保 target_state 维度也是 [B, State_Dim]
-        recon_loss = F.mse_loss(pred_next_state, target_state, reduction='none')
-        recon_loss = recon_loss.mean(dim=-1) # Average over features
+        # 1. Decode & Recon Loss
+        decoder_input = torch.cat([z_samples, h_exp], dim=-1) # [S, B, L+H]
+        pred_next_state = self.state_decoder(decoder_input)   # [S, B, State_Dim]
         
-        # KL Divergence Loss
-        # VAE 正则项: 限制分布接近 N(0, 1)
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
-
-        # [新增 Trick 1] Reward Prediction Loss
+        # MSE over features, Mean over samples
+        # reduction='none' -> [S, B, S_dim]
+        recon_loss = F.mse_loss(pred_next_state, s_target_exp, reduction='none')
+        recon_loss = recon_loss.sum(dim=-1).mean(dim=0) # [B]
+        
+        # 2. Reward Loss
         reward_loss = torch.zeros_like(recon_loss)
         if target_reward is not None:
-            pred_reward = self.reward_head(inp) # [B, 1]
-            # 计算 MSE Loss, 保持维度 [B, 1] -> [B]
-            r_loss = F.mse_loss(pred_reward, target_reward, reduction='none').squeeze(-1)
-            reward_loss = r_loss
+            # target_reward: [B, 1] -> [S, B, 1]
+            r_target_exp = target_reward.unsqueeze(0).expand(num_samples, -1, -1)
+            
+            pred_reward = self.reward_predictor(decoder_input) # [S, B, 1]
+            
+            r_loss = F.mse_loss(pred_reward, r_target_exp, reduction='none') # [S, B, 1]
+            reward_loss = r_loss.sum(dim=-1).mean(dim=0) # [B]
+        
+        # 3. KL Loss (Analytical)
+        # -0.5 * sum(1 + log(var) - mu^2 - var)
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1) # [B]
         
         return recon_loss, kl_loss, reward_loss
-    
 
-
-
-    # [新增这个方法到 VAERNNWorldModel 类中]
-    def decode(self, z, hidden_state):
-        """
-        手动解码预测 Next State
-        z: [B, Latent]
-        hidden_state: [B, Hidden]
-        """
-        inp = torch.cat([z, hidden_state], dim=-1) # [B, Latent + Hidden]
-        pred_next_state = self.decoder(inp)        # [B, State_Dim]
-        return pred_next_state
-    
     def predict(self, obs_input, hidden_state, use_mean=True):
         """
-        单步预测: State_t + Action_t -> State_{t+1}
+        兼容旧代码的单步预测接口
         """
-        # 1. 只有 Inference (Encoder + RNN)
         next_hidden, (mu, logvar) = self.forward_step(obs_input, hidden_state)
         
-        # 2. Latent Sampling (测试时通常使用均值 mu 以获得确定性结果)
-        z = mu if use_mean else self.sample_latents((mu, logvar), num_samples=1).squeeze(0)
-        
-        # 3. Decode
+        z = mu if use_mean else self.sample_latents((mu, logvar), num_samples=1)
+        # sample_latents 可能会 squeeze，这里确保一下逻辑
+        if z.dim() == 3: z = z.squeeze(0)
+            
         inp = torch.cat([z, next_hidden], dim=-1)
-        pred_next_state = self.decoder(inp) # [B, State_Dim]
+        pred_next_state = self.state_decoder(inp)
         
         return pred_next_state, next_hidden
-
