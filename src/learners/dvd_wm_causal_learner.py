@@ -43,6 +43,8 @@ class DVDWMCausalLearner:
         self.causal_beta = getattr(args, "causal_beta", 0.01)
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, per_weight=None):
+        # 获取 Batch 配置
+        bs = batch.batch_size
         max_seq_length = batch.max_seq_length
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
@@ -50,32 +52,39 @@ class DVDWMCausalLearner:
         mask = batch["filled"][:, :-1].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
-        bs = batch.batch_size
 
-        # --- 1. RL Agent Forward ---
+        # =================================================================
+        # 1. RL Agent Forward (Full Batch)
+        # =================================================================
         self.mac.agent.train()
         mac_out = []
         self.mac.init_hidden(bs)
-        for t in range(batch.max_seq_length):
+        for t in range(max_seq_length):
             agent_outs = self.mac.forward(batch, t=t)
             mac_out.append(agent_outs)
         mac_out = th.stack(mac_out, dim=1)
+        
+        # 提取当前动作对应的 Q 值
         chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
 
+        # Target MAC Forward
         with th.no_grad():
             self.target_mac.agent.train()
             target_mac_out = []
             self.target_mac.init_hidden(bs)
-            for t in range(batch.max_seq_length):
+            for t in range(max_seq_length):
                 target_agent_outs = self.target_mac.forward(batch, t=t)
                 target_mac_out.append(target_agent_outs)
             target_mac_out = th.stack(target_mac_out, dim=1)
+            
             mac_out_detach = mac_out.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
 
-        # --- 2. World Model & Causal Perturbation ---
+        # =================================================================
+        # 2. World Model & Causal Inference
+        # =================================================================
         joint_actions = batch["actions_onehot"].reshape(bs, max_seq_length, -1)
         wm_inputs = th.cat([batch["state"], joint_actions], dim=-1)
         
@@ -85,67 +94,123 @@ class DVDWMCausalLearner:
         z_history = []
         causal_weights_history = [] 
 
+        # 因果推断参数
+        reward_sensitivity = 10.0  # 奖励差异的权重系数
+        
         for t in range(max_seq_length):
-            # A. Factual Pass
+            # [关键]: 在 Update 前缓存当前时刻 hidden (h_t)
+            # 反事实推理的基础是: 给定当前的 h_t, 如果动作变了, h_{t+1} 会怎么变?
+            current_hidden = wm_hidden.detach().clone()
+            
+            # --- A. Factual Pass (事实路径) ---
             input_t = wm_inputs[:, t]
+            # wm_hidden 更新为 h_{t+1}
             wm_hidden, dist_params = self.world_model.forward_step(input_t, wm_hidden)
             
-            # B. Causal Perturbation Pass (Run only for valid training steps)
+            # --- B. Causal Perturbation Pass (反事实路径) ---
             if t < max_seq_length - 1:
                 with th.no_grad():
                     n_agents = self.args.n_agents
                     
-                    # 1. 扩展输入以进行并行推断 [B*N, Input_Dim]
-                    state_t = batch["state"][:, t] # [B, S]
-                    state_repeat = state_t.repeat_interleave(n_agents, dim=0) # [B*N, S]
+                    # 1. 数据准备与扩展
+                    # State [B, S] -> [B*N, S]
+                    state_t = batch["state"][:, t]
+                    state_repeat = state_t.repeat_interleave(n_agents, dim=0)
                     
-                    # 2. 构造 Masked Actions
-                    action_t = batch["actions_onehot"][:, t] # [B, N, A]
-                    action_expanded = action_t.unsqueeze(1).expand(-1, n_agents, -1, -1).clone() # [B, N, N, A]
+                    # Hidden [B, H] -> [B*N, H] (使用缓存的 h_t)
+                    hidden_repeat = current_hidden.repeat_interleave(n_agents, dim=0)
                     
-                    # 对角线Mask: 在第 i 组中 Mask 掉 Agent i
+                    # Action [B, N, A]
+                    action_t = batch["actions_onehot"][:, t]
+
+                    # 2. 构造反事实动作 (Counterfactual Actions)
+                    # 目标: 将对角线上的 Agent 动作替换为 Action 1 (Stop)
+                    
+                    # (a) 扩展原始动作 [B, 1, N, A] -> [B, N, N, A]
+                    action_exp = action_t.unsqueeze(1).expand(-1, n_agents, -1, -1).clone()
+                    
+                    # (b) 构造掩码
+                    # mask_mat (保留项): 对角线为 0, 其他为 1
                     mask_mat = 1.0 - th.eye(n_agents, device=self.device).view(1, n_agents, n_agents, 1)
-                    action_masked = action_expanded * mask_mat
-                    action_masked_flat = action_masked.view(bs * n_agents, -1) # [B*N, N*A]
+                    # inv_mask_mat (替换项): 对角线为 1, 其他为 0
+                    inv_mask_mat = 1.0 - mask_mat
                     
-                    perturbed_input = th.cat([state_repeat, action_masked_flat], dim=-1)
+                    # (c) 构造 Stop 动作向量 [1, 1, 1, A]
+                    # Action 1 是 Stop, 对应的 One-hot 是 [0, 1, 0, 0, ...]
+                    # 注意: 确保 n_actions >= 2
+                    stop_action = th.zeros(1, 1, 1, self.args.n_actions, device=self.device)
+                    if self.args.n_actions > 1:
+                        stop_action[..., 1] = 1.0 
                     
-                    # 3. 扩展 Hidden
-                    hidden_repeat = wm_hidden.detach().repeat_interleave(n_agents, dim=0)
+                    # (d) 融合: 原始动作 * Mask + Stop动作 * InvMask
+                    # 结果: 第 i 个平行宇宙中, Agent i 执行 Stop, 其他人保持原样
+                    action_cf_4d = (action_exp * mask_mat) + (stop_action * inv_mask_mat)
                     
-                    # 4. Counterfactual Forward
-                    _, cf_dist_params = self.world_model.forward_step(perturbed_input, hidden_repeat)
+                    # Flatten -> [B * N, N * A]
+                    action_cf_flat = action_cf_4d.view(bs * n_agents, -1)
                     
-                    # C. 计算 KL 散度因果效应
-                    # P (Factual): mu_fac, var_fac
-                    mu_fac, logvar_fac = dist_params
-                    mu_fac = mu_fac.detach().unsqueeze(1).expand(-1, n_agents, -1)
-                    logvar_fac = logvar_fac.detach().unsqueeze(1).expand(-1, n_agents, -1)
+                    # 3. 构造 WM 输入
+                    pert_input = th.cat([state_repeat, action_cf_flat], dim=-1)
+                    
+                    # 4. Counterfactual Forward (P(z | h_t, a_perturbed))
+                    # 得到反事实的 h'_{t+1} 和分布参数
+                    cf_hidden_next, cf_dist_params = self.world_model.forward_step(pert_input, hidden_repeat)
+                    
+                    # 5. 计算混合因果效应 (Hybrid Causal Effect)
+                    
+                    # --- Part 1: Physical Effect (KL Divergence) ---
+                    # 准备 Factual 参数 (扩展以匹配维度)
+                    mu_fac = dist_params[0].detach().unsqueeze(1).expand(-1, n_agents, -1)
+                    logvar_fac = dist_params[1].detach().unsqueeze(1).expand(-1, n_agents, -1)
                     var_fac = th.exp(logvar_fac)
                     
-                    # Q (Counterfactual)
-                    mu_cf, logvar_cf = cf_dist_params
-                    mu_cf = mu_cf.view(bs, n_agents, -1)
-                    logvar_cf = logvar_cf.view(bs, n_agents, -1)
+                    # 准备 Counterfactual 参数 (Reshape)
+                    mu_cf = cf_dist_params[0].view(bs, n_agents, -1)
+                    logvar_cf = cf_dist_params[1].view(bs, n_agents, -1)
                     var_cf = th.exp(logvar_cf)
                     
-                    # KL(P||Q)
+                    # KL(P || Q)
                     term1 = var_fac / (var_cf + 1e-8)
                     term2 = (mu_fac - mu_cf).pow(2) / (var_cf + 1e-8)
                     term3 = logvar_cf - logvar_fac
                     kl_div = 0.5 * th.sum(term1 + term2 + term3 - 1, dim=-1) # [B, N]
                     
-                    # 归一化作为权重 Teacher
-                    causal_weights = F.softmax(kl_div, dim=-1) 
+                    # --- Part 2: Value Effect (Reward Difference) ---
+                    # 利用 Reward Head 预测奖励
+                    
+                    # Factual Reward: Head(z_fac, h_{t+1})
+                    # 使用均值 z 预测 (deterministic)
+                    z_fac = dist_params[0].detach() 
+                    # 注意: 这里使用更新后的 wm_hidden (h_{t+1})
+                    fac_input_reward = th.cat([z_fac, wm_hidden.detach()], dim=-1)
+                    r_fac = self.world_model.reward_head(fac_input_reward) # [B, 1]
+                    r_fac_exp = r_fac.unsqueeze(1).expand(-1, n_agents, -1) # [B, N, 1]
+                    
+                    # Counterfactual Reward: Head(z_cf, h'_{t+1})
+                    z_cf = cf_dist_params[0] 
+                    # 注意: 这里使用反事实的 next hidden
+                    cf_input_reward = th.cat([z_cf, cf_hidden_next], dim=-1) 
+                    r_cf = self.world_model.reward_head(cf_input_reward) # [B*N, 1]
+                    r_cf_view = r_cf.view(bs, n_agents, -1) # [B, N, 1]
+                    
+                    # Reward Difference (MSE)
+                    # "如果我变成Stop, 预测奖励会变多少?"
+                    r_diff = (r_fac_exp - r_cf_view).pow(2).sum(dim=-1) # [B, N]
+                    
+                    # --- Combine Effects ---
+                    total_effect = kl_div + reward_sensitivity * r_diff
+                    
+                    causal_weights = F.softmax(total_effect, dim=-1)
                     causal_weights_history.append(causal_weights)
 
-            # C. 常规采样与 Loss
+            # --- C. WM Loss Calculation (Standard) ---
             z_samples = self.world_model.sample_latents(dist_params, num_samples=self.args.dvd_samples)
             z_history.append(z_samples)
             
             if t < max_seq_length - 1:
                 target_state = batch["state"][:, t+1]
                 target_reward = batch["reward"][:, t]
+                # 计算重建损失和奖励预测损失
                 r_l, k_l, rew_l = self.world_model.compute_loss(
                     z_samples, wm_hidden, target_state, dist_params, target_reward
                 )
@@ -154,6 +219,7 @@ class DVDWMCausalLearner:
         # 聚合 WM Loss
         mask_squeeze = mask.squeeze(-1)
         min_len = min(len(recon_losses), mask_squeeze.shape[1])
+        
         recon_stack = th.stack(recon_losses, dim=1)[:, :min_len]
         kl_stack = th.stack(kl_losses, dim=1)[:, :min_len]
         reward_stack = th.stack(reward_losses, dim=1)[:, :min_len]
@@ -163,37 +229,56 @@ class DVDWMCausalLearner:
                   self.args.wm_kl_beta * (kl_stack * mask_wm).sum() / mask_wm.sum() + \
                   (reward_stack * mask_wm).sum() / mask_wm.sum()
 
-        # --- 3. Mixer Forward & Alignment ---
-        z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3).detach()
+        # =================================================================
+        # 3. Mixer Forward & Alignment
+        # =================================================================
+        z_tensor = th.stack(z_history, dim=0).permute(1, 2, 0, 3).detach() # [D, B, T, L]
+        
+        # Z Warmup
         warmup_coef = 1.0 
         if getattr(self.args, "use_z_warmup", False) and t_env < self.args.z_warmup_steps:
              warmup_coef = float(t_env) / float(self.args.z_warmup_steps)
         z_tensor_mixer = z_tensor * warmup_coef
         z_eval = z_tensor_mixer[:, :, :-1]
         
+        # Mixer Forward
         mix_out = self.mixer(chosen_action_qvals, batch["state"][:, :-1], z_eval)
 
-        # === Alignment Logic ===
-        # Teacher: Causal Weights [B, T-1, N]
-        target_probs = th.stack(causal_weights_history, dim=1)
-        target_probs = th.clamp(target_probs, min=1e-6, max=1.0-1e-6)
+        # Alignment Loss
+        if len(causal_weights_history) > 0:
+            target_probs = th.stack(causal_weights_history, dim=1) # [B, T-1, N]
+            target_probs = th.clamp(target_probs, min=1e-6, max=1.0-1e-6)
+            
+            # 获取 Mixer 的 Attention 权重
+            mixer_raw = self.mixer.hyper_attention.last_attn_weights # [D*B*T, N, 1] or similar
+            d_samples = self.args.dvd_samples
+            # Reshape & Mean: [D, B, T, N] -> [B, T, N]
+            mixer_attn = mixer_raw.view(d_samples, bs, -1, self.args.n_agents).mean(dim=0)
+            
+            # 截断以匹配长度
+            valid_T = target_probs.shape[1]
+            mixer_attn = mixer_attn[:, :valid_T, :]
+            
+            mixer_log_prob = F.log_softmax(th.abs(mixer_attn), dim=-1)
+            
+            align_loss_raw = F.kl_div(mixer_log_prob, target_probs, reduction='none').sum(dim=-1)
+            align_loss = (align_loss_raw * mask_wm).sum() / mask_wm.sum()
+        else:
+            align_loss = th.tensor(0.0).to(self.device)
         
-        # Student: Mixer Attention
-        mixer_raw = self.mixer.hyper_attention.last_attn_weights
-        d_samples = self.args.dvd_samples
-        mixer_attn = mixer_raw.view(d_samples, bs, -1, self.args.n_agents).mean(dim=0)
-        
-        # 使用 log_softmax 保证数值稳定 (Input: abs(tanh))
-        mixer_log_prob = F.log_softmax(th.abs(mixer_attn), dim=-1)
-        
-        # KL Loss
-        align_loss_raw = F.kl_div(mixer_log_prob, target_probs, reduction='none').sum(dim=-1)
-        align_loss = (align_loss_raw * mask_wm).sum() / mask_wm.sum()
-        
-        # Warmup
-        current_beta = 0.0 if t_env < getattr(self.args, "align_start_steps", 0) else self.causal_beta
+        # Alignment Beta Annealing (线性衰减)
+        # 目的: 初期强引导, 后期让 RL 自适应
+        if t_env < getattr(self.args, "align_start_steps", 0):
+            curr_beta = 0.0
+        else:
+            decay_steps = 2000000 
+            progress = (t_env - self.args.align_start_steps) / decay_steps
+            decay_factor = max(0.0, 1.0 - progress)
+            curr_beta = self.causal_beta * decay_factor
 
-        # --- 4. Optimization ---
+        # =================================================================
+        # 4. Optimization
+        # =================================================================
         with th.no_grad():
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"], z_tensor_mixer)
             targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
@@ -201,19 +286,22 @@ class DVDWMCausalLearner:
 
         td_error = (mix_out - targets.detach())
         if td_error.shape[1] != mask.shape[1]:
-             min_len = min(td_error.shape[1], mask.shape[1])
              td_error = td_error[:, :min_len]
              mask = mask[:, :min_len]
              
         loss_td = (td_error ** 2 * mask.expand_as(td_error)).sum() / mask.sum()
         
-        total_loss = loss_td + self.args.wm_loss_weight * wm_loss + current_beta * align_loss
+        total_loss = loss_td + \
+                     self.args.wm_loss_weight * wm_loss + \
+                     curr_beta * align_loss
 
         self.optimiser.zero_grad()
         self.wm_optimiser.zero_grad()
         total_loss.backward()
+        
         th.nn.utils.clip_grad_norm_(self.rl_params, self.args.grad_norm_clip)
         th.nn.utils.clip_grad_norm_(self.wm_params, self.args.grad_norm_clip)
+        
         self.optimiser.step()
         self.wm_optimiser.step()
 
@@ -225,6 +313,7 @@ class DVDWMCausalLearner:
             self.logger.log_stat("loss_td", loss_td.item(), t_env)
             self.logger.log_stat("loss_wm", wm_loss.item(), t_env)
             self.logger.log_stat("loss_causal", align_loss.item(), t_env)
+            self.logger.log_stat("causal_beta", curr_beta, t_env)
             self.log_stats_t = t_env
 
     # 包含样板代码 (evaluate, cuda, save, load)
