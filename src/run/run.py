@@ -253,7 +253,7 @@ def run_sequential(args, logger):
                 if i == 0:
                     test_batch = batch
 
-            # 调用 Learner 计算 WM 指标
+            # 调用 Learner 计算 WM 指标你是谁？为什么要动胡文浩的电脑？
             if test_batch is not None and hasattr(learner, "evaluate_world_model"):
                 learner.evaluate_world_model(test_batch, runner.t_env)
 

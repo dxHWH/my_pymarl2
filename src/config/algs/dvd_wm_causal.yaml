@@ -1,3 +1,6 @@
+
+run: "dual_run"
+
 # --- DVD-WM Causal Config ---
 name: "dvd_wm_causal"
 
@@ -22,7 +25,7 @@ td_lambda: 0.6            # 缺失的 TD-Lambda 参数，用于计算多步回�
 
 # 2. World Model (标准 RNN-VAE)
 world_model_type: "vae_rnn"
-
+wm_batch_size: 128
 wm_hidden_dim: 128        # World Model RNN 隐层维度
 wm_latent_dim: 64         # Latent Z 维度
 wm_lr: 0.0005             # World Model 学习率
@@ -45,7 +48,7 @@ epsilon_start: 1.0
 epsilon_finish: 0.05
 epsilon_anneal_time: 100000
 runner: "episode"
-batch_size: 128
+batch_size: 64
 buffer_size: 5000
 t_max: 10500000
 learner_log_interval: 2000

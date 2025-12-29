@@ -19,12 +19,28 @@ from components.transforms import OneHot
 from learners.wm_learner import WMLearner
 from learners.dvd_wm_causal_learner import DVDWMCausalLearner
 
-def run_dual(args, logger):
+def run_dual(_run, config, _log):
     """
     Dual Run 入口函数：
-    既支持正常的双重训练循环，也支持通过 --evaluate 参数仅进行模型评估。
+    接收 Sacred 传递的标准参数 (_run, config, _log)
     """
+
+    # 将 config 字典转换为 Namespace (args)
+    args = SN(**config)
+    args.device = "cuda" if args.use_cuda else "cpu"
     
+    # 封装 Logger
+    logger = Logger(_log)
+
+    # =============================================================================
+    # [新增] 打印实验配置参数 (与原版 run.py 保持一致)
+    # =============================================================================
+    _log.info("Experiment Parameters:")
+    experiment_params = pprint.pformat(config,
+                                       indent=4,
+                                       width=1)
+    _log.info("\n\n" + experiment_params + "\n")
+
     # =============================================================================
     # 1. 初始化部分 (Runner & Env Info)
     # =============================================================================
@@ -37,7 +53,6 @@ def run_dual(args, logger):
 
     # =============================================================================
     # 2. 评估模式检查 (Evaluate Mode)
-    #    如果设置了 evaluate=True，则转入评估逻辑，不再进行训练
     # =============================================================================
     if args.evaluate:
         _evaluate_dual(args, runner, logger)
@@ -71,6 +86,9 @@ def run_dual(args, logger):
     # Setup MAC
     mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
 
+    # [关键修复]: 必须调用 setup 将 scheme 和 mac 注入 runner
+    runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=mac)
+
     # Learner 初始化 (Dual Learner)
     # (A) 初始化 World Model Learner
     if not hasattr(args, "wm_batch_size"):
@@ -85,13 +103,9 @@ def run_dual(args, logger):
     if args.use_cuda:
         rl_learner.cuda()
 
-    # (C) 加载 Checkpoint (如果存在)
+    # (C) 加载 Checkpoint
     if args.checkpoint_path != "":
         _load_checkpoint(args, rl_learner, wm_learner, logger)
-        # 如果加载了 checkpoint，通常将 t_env 更新为加载的步数
-        # 这里需要从 path 解析出 timestep，逻辑封装在 _load_checkpoint 比较复杂
-        # 简单起见，我们假设用户知道自己在做什么，或者在 _load_checkpoint 里处理 runner.t_env
-        pass 
 
     # -----------------------------------------------------------------------------
     # 训练主循环
@@ -112,21 +126,17 @@ def run_dual(args, logger):
         episode_batch = runner.run(test_mode=False)
         buffer.insert_episode_batch(episode_batch)
 
-        # Dual Sampling Logic
-        # Dual Sampling Logic
-        # 计算两者中最大的 Batch Size
+        # Dual Sampling Logic (Sample Max & Slice)
         max_batch_needed = max(args.batch_size, args.wm_batch_size)
 
         if buffer.can_sample(max_batch_needed):
             
-            # 1. 统一采样 (Sample Once)
-            # 采样足够大的 Batch 以满足两者需求
+            # 1. 统一采样
             episode_sample = buffer.sample(max_batch_needed)
             if episode_sample.device != args.device:
                 episode_sample.to(args.device)
 
-            # 2. 训练 World Model
-            # 如果 wm_bs 等于 max，直接用；否则切取前 wm_bs 个数据
+            # 2. 训练 World Model (使用 wm_batch_size 切片)
             if args.wm_batch_size == max_batch_needed:
                 wm_batch = episode_sample
             else:
@@ -134,9 +144,7 @@ def run_dual(args, logger):
             
             wm_learner.train(wm_batch, runner.t_env, logger)
             
-            # 3. 训练 RL Agent
-            # 如果 rl_bs 等于 max，直接用；否则切取前 rl_bs 个数据
-            # 关键点：这里使用的是和 WM 相同来源的数据（子集）
+            # 3. 训练 RL Agent (使用 rl_batch_size 切片)
             if args.batch_size == max_batch_needed:
                 rl_batch = episode_sample
             else:
@@ -144,10 +152,9 @@ def run_dual(args, logger):
                 
             rl_learner.train(rl_batch, runner.t_env, episode)
             
-            # 显式删除引用，辅助 GC
             del episode_sample
 
-        # Execute test runs once in a while
+        # Execute test runs
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
         if (runner.t_env - last_test_T) / args.test_interval >= 1.0:
 
@@ -183,15 +190,10 @@ def run_dual(args, logger):
 
 def _evaluate_dual(args, runner, logger):
     """
-    专门用于评估的函数 (对应原生的 evaluate_sequential)
+    专门用于评估的函数
     """
     logger.console_logger.info("Running evaluation (Dual Mode)...")
     
-    # 必须初始化 MAC 和 Learner 才能加载权重
-    # 虽然评估主要靠 MAC，但 DVDWMCausalLearner 的结构可能比较复杂，
-    # 且 args.checkpoint_path 需要被正确加载
-    
-    # 1. 建立临时的 Buffer Scheme (为了初始化 MAC)
     env_info = runner.get_env_info()
     scheme = {
         "state": {"vshape": env_info["state_shape"]},
@@ -202,11 +204,14 @@ def _evaluate_dual(args, runner, logger):
         "terminated": {"vshape": (1,), "dtype": th.uint8},
     }
     groups = {"agents": args.n_agents}
+    preprocess = {
+        "actions": ("actions_onehot", [OneHot(out_dim=args.n_actions)])
+    }
     
-    # 2. Init MAC
     mac = mac_REGISTRY[args.mac](scheme, groups, args)
+
+    runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=mac)
     
-    # 3. Init Learners (为了加载模型参数)
     if not hasattr(args, "wm_batch_size"):
         args.wm_batch_size = args.batch_size
     wm_learner = WMLearner(args)
@@ -215,15 +220,12 @@ def _evaluate_dual(args, runner, logger):
     rl_learner = DVDWMCausalLearner(mac, scheme, logger, args, wm_learner=wm_learner)
     if args.use_cuda: rl_learner.cuda()
 
-    # 4. 加载模型
     if args.checkpoint_path != "":
         _load_checkpoint(args, rl_learner, wm_learner, logger)
-        runner.t_env = 0 # 评估模式下 t_env 重置或从 checkpoint 读取皆可，主要影响 log
+        runner.t_env = 0 
     else:
         logger.console_logger.warning("Evaluate mode is on but no checkpoint_path provided! Testing with random weights.")
 
-    # 5. 执行评估循环
-    # 运行 args.test_nepisode 次
     n_test_runs = max(1, args.test_nepisode // runner.batch_size)
     
     logger.console_logger.info(f"Starting evaluation for {args.test_nepisode} episodes...")
@@ -251,7 +253,6 @@ def _load_checkpoint(args, rl_learner, wm_learner, logger):
             logger.console_logger.warning("Could not load World Model from checkpoint (maybe not saved or path error)!")
         return
 
-    # 标准目录结构加载
     logger.console_logger.info("Loading checkpoint from {}".format(args.checkpoint_path))
     for name in os.listdir(args.checkpoint_path):
         full_name = os.path.join(args.checkpoint_path, name)
@@ -267,8 +268,6 @@ def _load_checkpoint(args, rl_learner, wm_learner, logger):
 
     logger.console_logger.info("Loading model from {}".format(model_path))
     rl_learner.load_models(model_path)
-    # 尝试加载 WM，如果不强制要求 WM 必须存在（比如只想测 RL），可以加 try-except
-    # 但由于我们的架构强依赖 WM，这里抛出异常是合理的
     try:
         wm_learner.load_models(model_path)
     except Exception as e:

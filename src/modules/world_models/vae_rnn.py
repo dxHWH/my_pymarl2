@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class VaeRNN(nn.Module):
+class VAERNNWorldModel(nn.Module):
     def __init__(self, input_dim, args):
-        super(VaeRNN, self).__init__()
+        super(VAERNNWorldModel, self).__init__()
         self.args = args
         
         # 1. 维度解析

@@ -77,19 +77,20 @@ class WMLearner:
                 target_reward = batch["reward"][:, t]
                 mask = batch["filled"][:, t] # [B, 1]
                 
+                # [关键修正] 确保 mask 变成 [B] 以便与 Loss [B] 相乘，避免广播错误
+                mask = mask.squeeze(-1) 
+                
                 # Loss A (Full)
                 r_l_f, k_l_f, rew_l_f = self.world_model.compute_loss(
                     z_samples_full, wm_hidden_full, target_state, dist_params_full, target_reward
                 )
                 
-                # Loss B (Masked) - 强迫模型在信息缺失时还原真实状态
+                # Loss B (Masked)
                 r_l_m, k_l_m, rew_l_m = self.world_model.compute_loss(
                     z_samples_masked, wm_hidden_masked, target_state, dist_params_masked, target_reward
                 )
                 
-                # Masking (处理 padding)
-                mask = mask.expand_as(r_l_f)
-                
+                # 直接相加并应用 Mask (此时大家都是 [B])
                 recon_losses.append((r_l_f + r_l_m) * mask)
                 kl_losses.append((k_l_f + k_l_m) * mask)
                 reward_losses.append((rew_l_f + rew_l_m) * mask)
@@ -97,7 +98,7 @@ class WMLearner:
         # ---------------------------------------------------
         # 聚合 Loss 与 优化
         # ---------------------------------------------------
-        # 将 list stack 起来 -> [B, T]
+        # 将 list stack 起来 -> [T, B] -> sum -> scalar
         recon_loss = th.stack(recon_losses).sum() / batch["filled"].sum()
         kl_loss = th.stack(kl_losses).sum() / batch["filled"].sum()
         reward_loss = th.stack(reward_losses).sum() / batch["filled"].sum()
@@ -163,8 +164,9 @@ class WMLearner:
                     action_t = batch["actions_onehot"][:, t]
                     action_exp = action_t.unsqueeze(1).expand(-1, n_agents, -1, -1).clone() # [B, N, N, A]
                     
-                    # 对角线置 0
+                    # 对角线置 0 (Masking)
                     mask_mat = 1.0 - th.eye(n_agents, device=self.device).view(1, n_agents, n_agents, 1)
+                    # 结果: [B, N, N, A] -> [B*N, N*A] (Batch*Agent 被 Mask, Action Flat)
                     action_cf = (action_exp * mask_mat).view(bs * n_agents, -1)
                     
                     # 3. Counterfactual Forward (Zero Mask)
@@ -172,11 +174,12 @@ class WMLearner:
                     hidden_next_cf, dist_cf = self.world_model.forward_step(pert_input, hidden_repeat)
                     
                     # 4. 计算 Hybrid Effect (KL + Reward Diff)
-                    # (此处复用之前推导的公式，略去重复代码以节省篇幅，逻辑与之前一致)
-                    # ... [计算 KL 和 R_diff] ...
+                    # 传入的 dist_params 是 facts (h_next), dist_cf 是 counterfactual (h_next_cf)
+                    # 注意: 为了计算 Reward Diff，我们还需要 factual 的 next_hidden (wm_hidden)
+                    total_effect = self._compute_hybrid_effect(
+                        dist_params, dist_cf, wm_hidden, hidden_next_cf, n_agents, bs, reward_sensitivity
+                    )
                     
-                    # 简化示意:
-                    total_effect = self._compute_hybrid_effect(dist_params, dist_cf, wm_hidden, hidden_next_cf, n_agents, bs, reward_sensitivity)
                     causal_weights_history.append(F.softmax(total_effect, dim=-1))
         
         self.world_model.train() # 切回 Train 模式
@@ -187,33 +190,49 @@ class WMLearner:
         return causal_weights_history, z_tensor
 
     def _compute_hybrid_effect(self, dist_fac, dist_cf, h_fac, h_cf, n_agents, bs, sensitivity):
-        # 封装具体的 KL 和 Reward Diff 计算逻辑
-        # ... 实现细节同上一轮对话 ...
-        # 返回 total_effect [B, N]
-        
-        # 简写实现:
+        """
+        计算因果效应：物理效应 (KL) + 价值效应 (Reward Diff)
+        """
+        # 1. 准备参数
+        # Factual: [B, L] -> 扩展为 [B, N, L] 以便和 N 个反事实进行对比
         mu_fac = dist_fac[0].detach().unsqueeze(1).expand(-1, n_agents, -1)
         logvar_fac = dist_fac[1].detach().unsqueeze(1).expand(-1, n_agents, -1)
         var_fac = th.exp(logvar_fac)
         
+        # Counterfactual: [B*N, L] -> Reshape 为 [B, N, L]
         mu_cf = dist_cf[0].view(bs, n_agents, -1)
         logvar_cf = dist_cf[1].view(bs, n_agents, -1)
         var_cf = th.exp(logvar_cf)
         
+        # 2. 计算 KL 散度: KL(N_fac || N_cf)
+        # 公式: 0.5 * ( (var1 / var2) + (mu1 - mu2)^2 / var2 + ln(var2/var1) - k )
         term1 = var_fac / (var_cf + 1e-8)
         term2 = (mu_fac - mu_cf).pow(2) / (var_cf + 1e-8)
         term3 = logvar_cf - logvar_fac
-        kl_div = 0.5 * th.sum(term1 + term2 + term3 - 1, dim=-1)
+        # Sum over latent dimensions
+        kl_div = 0.5 * th.sum(term1 + term2 + term3 - 1, dim=-1) # [B, N]
         
-        # Reward
-        z_fac = dist_fac[0].detach()
-        r_fac = self.world_model.reward_head(th.cat([z_fac, h_fac.detach()], dim=-1)).unsqueeze(1).expand(-1, n_agents, -1)
+        # 3. 计算 Reward Difference
+        # Factual Reward: Head(z_fac, h_fac)
+        # z_fac: [B, L] -> Use Mean
+        z_fac = dist_fac[0].detach() 
+        # h_fac: [B, H]
+        r_in_fac = th.cat([z_fac, h_fac.detach()], dim=-1)
+        r_fac = self.world_model.reward_head(r_in_fac) # [B, 1]
+        r_fac_exp = r_fac.unsqueeze(1).expand(-1, n_agents, -1) # [B, N, 1]
         
-        z_cf = dist_cf[0]
-        r_cf = self.world_model.reward_head(th.cat([z_cf, h_cf], dim=-1)).view(bs, n_agents, -1)
+        # Counterfactual Reward: Head(z_cf, h_cf)
+        # z_cf: [B*N, L]
+        z_cf = dist_cf[0] 
+        # h_cf: [B*N, H]
+        r_in_cf = th.cat([z_cf, h_cf], dim=-1)
+        r_cf = self.world_model.reward_head(r_in_cf) # [B*N, 1]
+        r_cf_view = r_cf.view(bs, n_agents, -1) # [B, N, 1]
         
-        r_diff = (r_fac - r_cf).pow(2).sum(dim=-1)
+        # Squared Difference (L2)
+        r_diff = (r_fac_exp - r_cf_view).pow(2).sum(dim=-1) # [B, N]
         
+        # 4. 合并效应
         return kl_div + sensitivity * r_diff
 
     def cuda(self):
