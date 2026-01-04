@@ -234,6 +234,49 @@ class WMLearner:
         
         # 4. 合并效应
         return kl_div + sensitivity * r_diff
+    
+    def evaluate(self, batch, t_env, logger):
+        """
+        [新增] 评估模式：在测试集上计算 Loss，不更新梯度
+        只计算 Full Context 的 Loss，作为模型性能的基准
+        """
+        self.world_model.eval()
+        with th.no_grad():
+            bs = batch.batch_size
+            max_seq_length = batch.max_seq_length
+            
+            joint_actions = batch["actions_onehot"].reshape(bs, max_seq_length, -1)
+            wm_inputs = th.cat([batch["state"], joint_actions], dim=-1)
+            wm_hidden = self.world_model.init_hidden(bs, self.device)
+            
+            recon_losses, reward_losses = [], []
+            
+            for t in range(max_seq_length):
+                input_t = wm_inputs[:, t]
+                wm_hidden, dist_params = self.world_model.forward_step(input_t, wm_hidden)
+                z_samples = self.world_model.sample_latents(dist_params, num_samples=1) # mean sample usually better for eval, but sample keeps it consistent
+                
+                if t < max_seq_length - 1:
+                    target_state = batch["state"][:, t+1]
+                    target_reward = batch["reward"][:, t]
+                    mask = batch["filled"][:, t].squeeze(-1)
+                    
+                    r_l, _, rew_l = self.world_model.compute_loss(
+                        z_samples, wm_hidden, target_state, dist_params, target_reward
+                    )
+                    
+                    recon_losses.append(r_l * mask)
+                    reward_losses.append(rew_l * mask)
+            
+            # Normalize by valid steps
+            total_steps = batch["filled"].sum() + 1e-8
+            test_recon_loss = th.stack(recon_losses).sum() / total_steps
+            test_reward_loss = th.stack(reward_losses).sum() / total_steps
+            
+            logger.log_stat("test_wm_recon_loss", test_recon_loss.item(), t_env)
+            logger.log_stat("test_wm_reward_loss", test_reward_loss.item(), t_env)
+            
+        self.world_model.train()
 
     def cuda(self):
         self.world_model.cuda()
