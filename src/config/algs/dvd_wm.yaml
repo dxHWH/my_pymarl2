@@ -3,10 +3,10 @@
 action_selector: "epsilon_greedy"
 epsilon_start: 1.0
 epsilon_finish: 0.05
-epsilon_anneal_time: 50000
+epsilon_anneal_time: 100000
 
 runner: "episode"
-buffer_size: 5000
+buffer_size: 2500
 target_update_interval: 200
 
 # Learner & Mixer
@@ -44,3 +44,7 @@ use_z_bias: True    # 方案一：是否将 z 作为 bias 输入到 QMixer
 use_z_warmup: False      # 方案三：是否对 z 的使用进行预热
 z_warmup_steps: 150000   # 预热步数，z 的权重从 0 线性增加到 1 的时间
 use_single: False
+
+
+use_multiple: True  # 开关 CMIX 乘法模式
+cmix_beta: 0.1      # CMIX 论文中的缩放超参
