@@ -33,7 +33,7 @@ wm_lr: 0.0001            # World Model 学习率 (独立设置，通常比 RL �
 optimizer: 'adam'
 
 name: "dvd_wm_qmix"
-
+use_facZ: True
 # Agent params
 mac: "n_mac"
 agent: "n_rnn"

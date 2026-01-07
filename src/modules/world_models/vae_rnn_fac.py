@@ -35,7 +35,8 @@ class FactorizedVAERNN(nn.Module):
         
         # 聚合后的维度，建议与 Mixer 的 embedding 维度一致 (通常为 64 或 32)
         # 如果 args 中没有定义 mixing_embed_dim，默认为 64
-        self.att_embed_dim = getattr(args, "mixing_embed_dim", 64)
+        # self.att_embed_dim = getattr(args, "mixing_embed_dim", 64)
+        self.att_embed_dim = self.latent_dim
 
         # ===================================================================
         # 1. Factorized Encoder (Shared Weights across Agents)
