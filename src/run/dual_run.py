@@ -19,6 +19,9 @@ from components.transforms import OneHot
 from learners.wm_learner import WMLearner
 from learners.dvd_wm_causal_learner import DVDWMCausalLearner
 
+from learners.dvd_wm_fac_learner import DVDWMFacLearner
+
+
 def run_dual(_run, config, _log):
     """
     Dual Run 入口函数
