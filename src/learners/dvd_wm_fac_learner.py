@@ -16,19 +16,16 @@ class DVDWMFacLearner:
         self.last_target_update_episode = 0
         self.device = th.device('cuda' if args.use_cuda else 'cpu')
 
-        # 1. 初始化 Mixer (Factorized Version)
+        # 1. 初始化 Mixer
         self.mixer = None
         if args.mixer == "dvd_wm_fac":
             self.mixer = DVDWMFacMixer(args)
         else:
-            raise ValueError(f"Mixer {args.mixer} not recognised for DVDWMFacLearner. Please use 'dvd_wm_fac'.")
+            raise ValueError(f"Mixer {args.mixer} not recognised for DVDWMFacLearner.")
         
         self.target_mixer = copy.deepcopy(self.mixer)
 
-        # 2. 初始化 World Model (Factorized Version)
-        # Fix Tautology: 输入仅为局部 Obs + Action
-        # Input Shape = Obs_Dim + Action_Dim
-        # Output Shape = Obs_Dim (Reconstruction)
+        # 2. 初始化 World Model
         self.obs_dim = scheme["obs"]["vshape"]
         self.act_dim = scheme["actions_onehot"]["vshape"][0]
         
@@ -58,50 +55,42 @@ class DVDWMFacLearner:
         # ----------------------------------------------------------------------
         # Part A: World Model Forward (Dynamics Learning)
         # ----------------------------------------------------------------------
-        # 准备数据: Obs & Actions [Batch, Seq_Len, N_Agents, Dim]
-        # 我们使用整个序列 (0 to T) 来生成 Z，以便后续切片
+        # 准备数据 [Batch, Seq, N, Dim]
         full_obs = batch["obs"].to(self.device)
         full_actions = batch["actions_onehot"].to(self.device)
         
-        # WM 前向传播 (并行处理整个序列，比循环快)
-        # z_all: [Batch, Seq, Embed_Dim] (聚合后的去混淆因子)
-        # recon_all: [Batch, Seq, N, Obs_Dim] (局部重构)
-        # mu, logvar: [Batch, Seq, N, Latent]
+        # WM 前向传播
+        # 注意：z_all 现在是 [Batch, Seq, N, 64] (保留了 Agent 维度)
         z_all, recon_all, mu, logvar, _ = self.world_model(full_obs, full_actions)
         
-        # 计算 WM Loss (Target 是 Obs)
-        # 我们预测的是 obs[t] -> recon[t] (AutoEncoder模式) 
-        # 或者 obs[t], act[t] -> obs[t+1] (Predictive模式)?
-        # 根据 vae_rnn_fac 的设计，它是 RNN，在 t 时刻输出的是对当前步或下一步的理解。
-        # 通常做法：Inputs[:, :-1] -> Target[:, 1:] (预测未来)
-        # 这里我们需要重新运行一下 forward，传入 [:-1] 的数据，预测 [1:]
-        
+        # 计算 WM Loss (预测未来: Input[:,-1] -> Target[:,1:])
         obs_input = full_obs[:, :-1]
         act_input = full_actions[:, :-1]
         target_obs = full_obs[:, 1:]
         
-        # 重新跑一次 slice 后的 forward 用于算 Loss，保证因果性
+        # 重新跑一次切片后的前向，保证 Loss 计算严谨
+        # 这里 recon_out 是 [Batch, Seq-1, N, Obs_Dim]
         _, recon_out, mu_train, logvar_train, _ = self.world_model(obs_input, act_input)
         
         # 1. Reconstruction Loss (MSE)
         recon_loss = F.mse_loss(recon_out, target_obs, reduction='none')
-        recon_loss = recon_loss.sum(dim=-1).mean() # Sum over dim, Mean over batch/agent
+        recon_loss = recon_loss.sum(dim=-1).mean() # Sum over features, Mean over rest
         
         # 2. KL Divergence
         kld_loss = -0.5 * th.sum(1 + logvar_train - mu_train.pow(2) - logvar_train.exp(), dim=-1)
         kld_loss = kld_loss.mean()
         
-        wm_loss = recon_loss + self.args.wm_kl_beta * kld_loss
+        # [修复] 使用正确的参数名 wm_kl_beta
+        beta = getattr(self.args, "wm_kl_beta", getattr(self.args, "beta", 0.1))
+        wm_loss = recon_loss + beta * kld_loss
 
         # ----------------------------------------------------------------------
         # Part B: Prepare Z for Mixer (Deconfounding)
         # ----------------------------------------------------------------------
-        # z_all 对应的是 full_obs 的时间步
-        # z_curr (用于 Q): 对应 obs 0...T-1
-        # z_next (用于 Target Q): 对应 obs 1...T
-        
-        z_curr = z_all[:, :-1].detach()
-        z_next = z_all[:, 1:].detach()
+        # 切片 Z，分别用于 Q_eval 和 Target_Q
+        # z_all: [B, T, N, Z]
+        z_curr = z_all[:, :-1].detach() # 对应 t=0 ~ T-1
+        z_next = z_all[:, 1:].detach()  # 对应 t=1 ~ T
         
         # Z-Warmup (可选)
         warmup_coef = 1.0
@@ -128,11 +117,12 @@ class DVDWMFacLearner:
         for t in range(batch.max_seq_length):
             agent_outs = self.mac.forward(batch, t=t)
             mac_out.append(agent_outs)
-        mac_out = th.stack(mac_out, dim=1)
+        mac_out = th.stack(mac_out, dim=1) # [B, T, N, A]
         
+        # Pick Q-values for chosen actions
         chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
 
-        # 2. Calculate Target Q-Values
+        # 2. Calculate Target Q-Values (Double Q-Learning)
         with th.no_grad():
             self.target_mac.init_hidden(batch.batch_size)
             target_mac_out = []
@@ -141,29 +131,41 @@ class DVDWMFacLearner:
                 target_mac_out.append(target_agent_outs)
             target_mac_out = th.stack(target_mac_out, dim=1)
             
+            # Mask out unavailable actions
             mac_out_detach = mac_out.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
+            
+            # Greedy action selection
             cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1]
             target_max_qvals = th.gather(target_mac_out[:, 1:], dim=3, index=cur_max_actions).squeeze(3)
             
-            # Target Mixer: 传入 State[:, 1:] 和 Z_next
+            # Target Mixer: 传入 State[:, 1:] 和 z_next (Agent-wise Z)
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:], z_next)
 
-        # 3. Mixer: 传入 State[:, :-1] 和 Z_curr
+        # 3. Mixer: 传入 State[:, :-1] 和 z_curr (Agent-wise Z)
+        # Mixer 内部会处理 [B, T, N, Z] 的维度
         chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1], z_curr)
 
         # 4. TD Error
         targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
                                         self.args.n_agents, self.args.gamma, self.args.td_lambda)
 
+        # [核心修复] 强制对齐维度，防止 83 vs 82 报错
+        # 取两者最小的时间步数进行截断
+        min_t = min(chosen_action_qvals.shape[1], targets.shape[1])
+        chosen_action_qvals = chosen_action_qvals[:, :min_t]
+        targets = targets[:, :min_t]
+        mask = mask[:, :min_t]
+
         td_error = (chosen_action_qvals - targets.detach())
-        loss_td = (td_error ** 2 * mask.expand_as(td_error)).sum() / mask.sum()
+        
+        # 0-out the targets that came from padded data
+        masked_td_error = td_error * mask.expand_as(td_error)
+        loss_td = (masked_td_error ** 2).sum() / mask.sum()
 
         # ----------------------------------------------------------------------
         # Part D: Optimization
         # ----------------------------------------------------------------------
-        # 组合 Loss (可选权重)
-        # 注意: WM 梯度和 RL 梯度在此处汇合，但由于 z.detach()，RL 梯度不会传给 WM
         total_loss = loss_td + getattr(self.args, "wm_loss_weight", 1.0) * wm_loss
 
         self.optimiser.zero_grad()
@@ -198,10 +200,8 @@ class DVDWMFacLearner:
 
     def evaluate_world_model(self, batch, t_env):
         """
-        评估 WM 性能: 
-        由于 Factorized WM 是局部观测重构，我们评估 Obs 的 MSE。
+        评估 WM 性能: 局部观测重构误差 MSE
         """
-        # 1. 准备数据
         obs = batch["obs"].to(self.device)
         actions = batch["actions_onehot"].to(self.device)
         mask = batch["filled"][:, :-1].float().squeeze(-1)
@@ -210,23 +210,18 @@ class DVDWMFacLearner:
         act_input = actions[:, :-1]
         target_obs = obs[:, 1:]
 
-        # 2. 评估模式
         self.world_model.eval()
         
         with th.no_grad():
-            # 前向传播 (并行序列)
             _, recon_out, _, _, _ = self.world_model(obs_input, act_input)
             
             # 计算 MSE
             errors = (recon_out - target_obs) ** 2
-            # [B, T, N, Obs] -> Mean over Obs -> [B, T, N]
-            mse_per_agent = errors.mean(dim=-1)
-            # Sum over Agents -> [B, T]
-            mse_per_step = mse_per_agent.mean(dim=-1)
+            mse_per_step = errors.mean(dim=-1).mean(dim=-1) # Mean over Obs & Agents
             
             masked_mse = (mse_per_step * mask).sum() / mask.sum()
 
-            # R2 Score 近似计算
+            # 简单的 R2 计算
             target_flat = target_obs.reshape(-1, self.obs_dim)
             pred_flat = recon_out.reshape(-1, self.obs_dim)
             ss_res = ((target_flat - pred_flat) ** 2).sum()

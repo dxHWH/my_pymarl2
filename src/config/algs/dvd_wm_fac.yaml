@@ -6,7 +6,7 @@ epsilon_finish: 0.05
 epsilon_anneal_time: 100000
 
 runner: "episode"
-buffer_size: 2500
+buffer_size: 5000
 target_update_interval: 200
 
 # Learner & Mixer

@@ -26,7 +26,14 @@ class FactorizedVAERNN(nn.Module):
         self.args = args
         self.input_shape = input_shape
         self.output_shape = output_shape
-        self.hidden_dim = args.rnn_hidden_dim
+        # [!!! 核心修复 !!!] 
+        # 在这里实现解耦：
+        # 如果 args 里有 wm_hidden_dim (128)，就用它作为 WM 的隐藏层。
+        # 如果没有，才回退到 rnn_hidden_dim (64)。
+        # 这样 Agent 用 64，WM 用 128，互不干扰。
+        self.hidden_dim = getattr(args, "wm_hidden_dim", args.rnn_hidden_dim)
+
+        
         # === 修复：兼容不同的参数命名 ===
         if hasattr(args, "wm_latent_dim"):
             self.latent_dim = args.wm_latent_dim
@@ -70,6 +77,7 @@ class FactorizedVAERNN(nn.Module):
         self.att_query = nn.Linear(self.latent_dim, self.att_embed_dim)
         self.att_key = nn.Linear(self.latent_dim, self.att_embed_dim)
         self.att_val = nn.Linear(self.latent_dim, self.att_embed_dim)
+        print("##########using new wm#########")
 
     def reparameterize(self, mu, logvar):
         """
@@ -171,11 +179,19 @@ class FactorizedVAERNN(nn.Module):
         attn_weights = F.softmax(scores, dim=-1)
         
         # 加权聚合: 此时 z_weighted 中的每个 Agent 特征都融合了与之相关的其他 Agent 信息
-        z_weighted = torch.matmul(attn_weights, v) # [B, T, N, Emb]
-        
-        # --- Global Pooling ---
-        # 将 N 个 Agent 的特征压缩为一个全局向量，供 Mixer 使用
-        # Mean Pooling 是一种对 Agent 数量不敏感的聚合方式，利于迁移学习
-        z_for_mixer = z_weighted.mean(dim=2) # [B, T, Emb]
+        z_attended = torch.matmul(attn_weights, v) # [B, T, N, Emb]
+
+
+        # [修改]不要做 Mean Pooling 
+        # 我们直接把每个 Agent 的 Z 给 Mixer，让 Mixer 自己决定怎么用
+        z_for_mixer = z_attended  # 保持 [B, T, N, 64]
         
         return z_for_mixer, recon_out, mu, logvar, h_out
+    
+        # #------------------------------------------------------------------------------       
+        # # --- Global Pooling ---
+        # # 将 N 个 Agent 的特征压缩为一个全局向量，供 Mixer 使用
+        # # Mean Pooling 是一种对 Agent 数量不敏感的聚合方式，利于迁移学习
+        # z_for_mixer = z_weighted.mean(dim=2) # [B, T, Emb]
+        
+        # return z_for_mixer, recon_out, mu, logvar, h_out
